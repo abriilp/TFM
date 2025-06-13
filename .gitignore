@@ -1,0 +1,4 @@
+wandb/
+checkpoint/
+*.tar
+__pycache__/
