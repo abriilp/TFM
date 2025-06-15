@@ -372,18 +372,18 @@ def main_worker(gpu, ngpus_per_node, args):
             os.system('mkdir -p {}'.format(save_folder_path))
 
     # Training loop with validation
-    for epoch in range(args.start_epoch, 120+args.start_epoch):
+    for epoch in range(args.start_epoch, args.epochs+args.start_epoch):
         if args.distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
         # Training
-        train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args)
+        last_training_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args)
         
         # Validation (configurable frequency)
-        val_freq = getattr(args, 'validation_freq', 5)  # Default: validate every 5 epochs
+        val_freq = getattr(args, 'validation_freq', 1)  # Default: validate every 5 epochs
         if epoch % val_freq == 0 or epoch == args.start_epoch:
             print(f"Running validation at epoch {epoch}")
-            val_metrics = validate_D(val_loader, model, epoch, args)
+            val_metrics = validate_D(val_loader, model, epoch, args, current_step=last_training_step)
             
             # Log validation summary
             if args.is_master and not args.disable_wandb and val_metrics:
@@ -467,15 +467,15 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
             mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
             intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]
 
-            recon_img = model([intrinsic, extrinsic_input], run_encoder = False).float()
+            relit_img = model([intrinsic_input, extrinsic_ref], run_encoder = False).float()
 
         
         logdet_pred, logdet_target = logdet_loss(intrinsic_input)
         logdet_pred_ext, logdet_target_ext = logdet_loss([extrinsic_input])
         sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
-        rec_loss = nn.MSELoss()(recon_img,input_img)
-        ssim_component = 0.1 * (1 - ssim_loss(recon_img,input_img))
-        grad_component = gradient_loss(recon_img,input_img)
+        rec_loss = nn.MSELoss()(relit_img,input_img)
+        ssim_component = 0.1 * (1 - ssim_loss(relit_img,input_img))
+        grad_component = gradient_loss(relit_img,input_img)
 
         rec_loss_total = 10 * rec_loss + ssim_component + grad_component
         logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
@@ -526,7 +526,7 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
                 log_training_visualizations(
                     input_img=input_img,
                     ref_img=ref_img,
-                    recon_img=recon_img,
+                    relit_img=relit_img,
                     noisy_input_img=noisy_input_img,
                     noisy_ref_img=noisy_ref_img,
                     step=current_step,
@@ -549,32 +549,39 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
         plot_relight_img_train(model, input_img, ref_img, target_img, args.save_folder_path + '/{:05d}_{:05d}_gen'.format(epoch + 1, i))
 
     torch.distributed.barrier()
+    return current_step
 
 
-def validate_D(val_loader, model, epoch, args):
+def validate_D(val_loader, model, epoch, args, current_step=None):
     """Validation function with visualizations"""
-    from visu_utils import log_training_visualizations
+    from visu_utils import log_relighting_results
     
     model.eval()
     val_metrics = {}
     
+    # Global step counter for wandb logging
+    if current_step is None:
+        current_step = epoch * len(val_loader)
+
     with torch.no_grad():
-        for i, (input_img, ref_img) in enumerate(val_loader):
+        for i, (input_img, ref_img, gt_img) in enumerate(val_loader):
+            val_step = current_step + i
             if i >= getattr(args, 'max_val_batches', 5):  # Limit validation batches for speed
                 break
                 
             input_img = input_img.to(args.gpu)
             ref_img = ref_img.to(args.gpu)
+            gt_img = gt_img.to(args.gpu)
             
             # Forward pass without noise for validation
             intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
             intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
             
-            # Simple reconstruction for validation
-            recon_img = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+            # Simple relighting for validation
+            relit_img = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
             
             # Compute validation metrics
-            val_loss = nn.MSELoss()(recon_img, input_img)
+            val_loss = nn.MSELoss()(relit_img, input_img)
             
             if i == 0:  # Log metrics from first batch
                 val_metrics = {
@@ -583,18 +590,19 @@ def validate_D(val_loader, model, epoch, args):
                 }
             
             # Log validation visualizations
-            if args.is_master and not args.disable_wandb and i == 0:  # Only first batch
-                log_training_visualizations(
+            if args.is_master and not args.disable_wandb and i in [0, 1]:  # Only first and second batch 
+                log_relighting_results(
+                    #model,
                     input_img=input_img,
                     ref_img=ref_img,
-                    recon_img=recon_img,
-                    step=epoch,
-                    mode='validation',
-                    max_images=getattr(args, 'max_viz_images', 4)
+                    relit_img=relit_img,
+                    gt_img=gt_img,
+                    step=val_step,
+                    mode='validation'
                 )
                 
                 if val_metrics:
-                    wandb.log(val_metrics, step=epoch)
+                    wandb.log(val_metrics, step=val_step)
     
     model.train()
     return val_metrics

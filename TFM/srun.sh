@@ -5,7 +5,8 @@
 #export CUDA_LAUNCH_BLOCKING=1
 #export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-
+source /home/apinyol/anaconda3/etc/profile.d/conda.sh
+conda activate latent_intrinsics
 
 while
   port=$(shuf -n 1 -i 49152-65535)
@@ -21,7 +22,7 @@ echo "NODELIST="${SLURM_NODELIST}
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$master_addr
 echo "MASTER_ADDR="$MASTER_ADDR
-data_path=/home/apinyol/TFM/Data/RSR_256_mini
+data_path=/home/apinyol/TFM/Data/multi_illumination_train_mip2_jpg
 #/home/apinyol/TFM/Data/RSR_256
 #/home/apinyol/TFM/Data/iiw-dataset/data
 #/home/apinyol/TFM/Data/multi_illumination_train_mip2_jpg
@@ -31,14 +32,14 @@ python -m torch.distributed.launch \
 --data_path ${data_path} \
 --reg_weight 1e-4 \
 --intrinsics_loss_weight 1e-1 \
---epochs 120 \
---batch_size 8 \
+--epochs 5 \
+--batch_size 4 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
 --resume \
---wandb_project "intrinsic relighting2" \
---wandb_run_name "prova" \
+--wandb_project "Latent_Intrinsics_Relighting" \
+--wandb_run_name "mit_finetuning" \
 --resume \
 --dataset mit \
---visu_path /home/apinyol/TFM/Latent_Intrinsics/relight_result_proves1
+#--visu_path /home/apinyol/TFM/Latent_Intrinsics/relight_result_proves1
  

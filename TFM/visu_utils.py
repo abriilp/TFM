@@ -140,7 +140,7 @@ def create_image_grid(images, nrow=4, padding=2, normalize=True):
     return images
 
 
-def log_training_visualizations(input_img, ref_img, recon_img, step, mode='train', 
+def log_training_visualizations(input_img, ref_img, relit_img, step, mode='train', 
                                noisy_input_img=None, noisy_ref_img=None, max_images=4):
     """
     Log training/validation visualizations to wandb
@@ -162,7 +162,7 @@ def log_training_visualizations(input_img, ref_img, recon_img, step, mode='train
     # Select subset of images
     input_viz = input_img[:batch_size]
     ref_viz = ref_img[:batch_size]
-    recon_viz = recon_img[:batch_size]
+    recon_viz = relit_img[:batch_size]
     
     # Create image grids
     nrow = min(batch_size, 4)  # Max 4 images per row
@@ -175,7 +175,7 @@ def log_training_visualizations(input_img, ref_img, recon_img, step, mode='train
     wandb_images = {
         f'{mode}/input_images': wandb.Image(input_grid, caption=f'{mode.title()} Input Images'),
         f'{mode}/reference_images': wandb.Image(ref_grid, caption=f'{mode.title()} Reference Images'),
-        f'{mode}/reconstructed_images': wandb.Image(recon_grid, caption=f'{mode.title()} Reconstructed Images'),
+        f'{mode}/relit_images': wandb.Image(recon_grid, caption=f'{mode.title()} Relit Images'),
     }
     
     # Add noisy images if provided (training only)
@@ -186,14 +186,14 @@ def log_training_visualizations(input_img, ref_img, recon_img, step, mode='train
         noisy_input_grid = create_image_grid(noisy_input_viz, nrow=nrow)
         noisy_ref_grid = create_image_grid(noisy_ref_viz, nrow=nrow)
         
-        wandb_images.update({
+        """wandb_images.update({
             f'{mode}/noisy_input_images': wandb.Image(noisy_input_grid, caption=f'{mode.title()} Noisy Input Images'),
             f'{mode}/noisy_reference_images': wandb.Image(noisy_ref_grid, caption=f'{mode.title()} Noisy Reference Images'),
-        })
+        })"""
     
     # Create comparison grid (side by side)
     comparison_grid = create_comparison_grid(input_viz, ref_viz, recon_viz, nrow=nrow)
-    wandb_images[f'{mode}/comparison'] = wandb.Image(comparison_grid, caption=f'{mode.title()} Comparison: Input | Reference | Reconstructed')
+    wandb_images[f'{mode}/comparison'] = wandb.Image(comparison_grid, caption=f'{mode.title()} Comparison: Input | Reference | Relit')
     
     # Log to wandb
     wandb.log(wandb_images, step=step)
@@ -223,7 +223,7 @@ def create_comparison_grid(input_img, ref_img, recon_img, nrow=4):
     return grid_np
 
 
-def log_relighting_results(model, input_img, ref_img, target_img, step, mode='train'):
+def log_relighting_results(input_img, ref_img, relit_img, gt_img, step, mode='train'): #model, 
     """
     Log relighting results for specific target lighting conditions
     
@@ -235,31 +235,32 @@ def log_relighting_results(model, input_img, ref_img, target_img, step, mode='tr
         step: Current step
         mode: 'train' or 'validation'
     """
-    model.eval()
+    #model.eval()
     
     with torch.no_grad():
-        # Extract features
+        """# Extract features
         intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
-        intrinsic_target, extrinsic_target = model(target_img, run_encoder=True)
+        intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
         
         # Relight using target lighting
-        relit_img = model([intrinsic_input, extrinsic_target], run_encoder=False).float()
-        
+        relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
+        """
         # Create visualization
         batch_size = min(input_img.shape[0], 4)
         nrow = min(batch_size, 4)
         
         input_viz = input_img[:batch_size]
-        target_viz = target_img[:batch_size]
+        ref_viz = ref_img[:batch_size]
         relit_viz = relit_img[:batch_size]
+        gt_viz = gt_img[:batch_size]
         
         # Create relighting comparison grid
         relight_comparison = []
         for i in range(batch_size):
-            relight_comparison.extend([input_viz[i], target_viz[i], relit_viz[i]])
+            relight_comparison.extend([input_viz[i], ref_viz[i], relit_viz[i], gt_viz[i]])
         
         relight_tensor = torch.stack(relight_comparison)
-        relight_grid = make_grid(relight_tensor, nrow=3, padding=2, normalize=True)
+        relight_grid = make_grid(relight_tensor, nrow=4, padding=2, normalize=True)
         relight_grid_np = tensor_to_numpy(relight_grid)
         
         if relight_grid_np.shape[0] == 3:
@@ -271,11 +272,11 @@ def log_relighting_results(model, input_img, ref_img, target_img, step, mode='tr
         wandb.log({
             f'{mode}/relighting_results': wandb.Image(
                 relight_grid_np, 
-                caption=f'{mode.title()} Relighting: Input | Target Light | Relit Result'
+                caption=f'{mode.title()} Relighting: Input | Target Light | Relit Result | Ground Truth'
             )
         }, step=step)
     
-    model.train()
+    #model.train()
 
 
 def log_feature_visualizations(intrinsic_features, extrinsic_features, step, mode='train'):
