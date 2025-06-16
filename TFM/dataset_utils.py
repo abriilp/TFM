@@ -1,195 +1,244 @@
 import os
-import glob
-import numpy as np
-from PIL import Image
 import torch
-from torch.utils import data
-import re
-from collections import defaultdict
+from torch.utils.data import Dataset
+from PIL import Image
+import random
+import glob
 
-class RSRDataset(data.Dataset):
-    def __init__(self, root, img_transform, epoch_multiplier=10, 
-                 total_split=4, split_id=0, light_colors=[1]):
+class RSRDataset(Dataset):
+    def __init__(self, root_dir, img_transform=None, scenes=None, is_validation=False, validation_scenes=None):
         """
-        Dataset for lighting scenes with opposing light position pairs.
+        RSR Dataset for relighting tasks
         
         Args:
-            root: Path to dataset root containing scene folders
-            img_transform: [group_transform, single_transform] for data augmentation
-            epoch_multiplier: Multiplier for epoch length
-            total_split: Total number of splits for distributed training
-            split_id: Current split ID for distributed training
+            root_dir: Path to the dataset root directory containing scene folders
+            img_transform: List of image transformations [group_transform, single_transform]
+            scenes: List of scene names to use. If None, auto-splits all scenes (all-2 for train, 2 for val)
+            is_validation: If True, enables validation mode with cross-scene references
+            validation_scenes: Specific scenes to use for validation (only used when scenes=None)
         """
-        self.epoch_multiplier = epoch_multiplier
-        self.single_img_transform = img_transform[1]
-        self.group_img_transform = img_transform[0]
-        self.light_colors = light_colors
+        self.root_dir = root_dir
+        self.is_validation = is_validation
         
-        # Define opposing light position pairs basedf on your 3x3 grid
-        # Grid layout:
-        # 5 4 3
-        # 6 1 2  
-        # 7 8 9
-        self.opposing_pairs = {
-            1: [5, 7, 9, 3, 4, 6, 2, 8],  # center -> corners
-            2: [6, 5, 7],     # right -> left and bottom
-            3: [7, 6, 8],     # top-right -> bottom corners
-            4: [8, 7, 9],        # top -> bottom
-            5: [9, 8, 2],     # top-left -> center and bottom-right
-            6: [2, 3, 9],     # left -> right positions
-            7: [2, 3, 4],     # bottom-left -> center and top-right
-            8: [2, 3, 5],     # bottom -> top positions
-            9: [4, 5, 6]   # bottom-right -> center and corners
-        }
+        # Handle transform assignment
+        if img_transform is not None and isinstance(img_transform, list):
+            self.group_img_transform = img_transform[0]
+            self.single_img_transform = img_transform[1]
+        else:
+            self.group_img_transform = None
+            self.single_img_transform = img_transform
         
-        # Load and organize images by scene
-        self.scene_images = self._load_scenes(root, total_split, split_id)
-        print(f'Initialized with {len(self.scene_images)} scenes')
+        # Get all scene directories
+        all_scenes = [d for d in os.listdir(root_dir) 
+                     if os.path.isdir(os.path.join(root_dir, d))]
+        all_scenes.sort()  # Sort for reproducible splits
         
-    def _parse_filename(self, filename):
-        """
-        Parse filename to extract lighting parameters.
-        Format: {index}_{group}_{pan}_{tilt}_{R}_{G}_{B}_{scene}_{not_use}_{light_color}_{light_pos}
-        """
-        basename = os.path.basename(filename).split('.')[0]  # Remove extension
-        parts = basename.split('_')
-        
-        if len(parts) < 11:
-            return None
+        if scenes is not None:
+            # Use explicitly provided scenes
+            self.scenes = [s for s in scenes if s in all_scenes]
+        else:
+            # Auto-split: use all scenes except 2 for training, 2 for validation
+            if len(all_scenes) < 2:
+                raise ValueError(f"Need at least 2 scenes for auto-split, found {len(all_scenes)}")
             
-        try:
-            return {
-                'index': int(parts[0]),
-                'group': int(parts[1]),
-                'pan': float(parts[2]),
-                'tilt': float(parts[3]),
-                'R': int(parts[4]),
-                'G': int(parts[5]),
-                'B': int(parts[6]),
-                'scene': int(parts[7]),
-                'not_use': int(parts[8]),
-                'light_color': int(parts[9]),
-                'light_pos': int(parts[10])
-            }
-        except (ValueError, IndexError):
-            return None
-    
-    def _load_scenes(self, root, total_split, split_id):
-        """Load and organize images by scene, filtering for light color 1"""
-        scene_folders = sorted(glob.glob(os.path.join(root, '*')))
-        scene_folders = compute_rank_split(scene_folders, total_split, split_id)
+            # Determine validation scenes
+            if validation_scenes is not None:
+                val_scenes = [s for s in validation_scenes if s in all_scenes]
+                if len(val_scenes) < 2:
+                    # Fallback to last 2 scenes if provided validation_scenes are invalid
+                    val_scenes = all_scenes[-2:]
+                    print(f"Warning: Using last 2 scenes for validation: {val_scenes}")
+            else:
+                # Use last 2 scenes for validation by default
+                val_scenes = all_scenes[-2:]
+            
+            if self.is_validation:
+                self.scenes = val_scenes
+                # Store all scenes for cross-scene reference selection
+                self.all_available_scenes = all_scenes
+            else:
+                # Training: use all scenes except validation scenes
+                self.scenes = [s for s in all_scenes if s not in val_scenes]
+                
+        if not self.scenes:
+            raise ValueError(f"No valid scenes found in {root_dir}")
         
-        scene_images = {}
+        print(f"Using scenes: {self.scenes}")
+        if self.is_validation and hasattr(self, 'all_available_scenes'):
+            print(f"All available scenes for cross-reference: {self.all_available_scenes}")
         
-        for scene_folder in scene_folders:
-            if not os.path.isdir(scene_folder):
+        # Parse all images and organize by scene, camera_pos, light_pos
+        self.image_data = {}  # scene -> camera_pos -> light_pos -> image_path
+        self.all_images = []  # List of all valid image paths for iteration
+        
+        # If validation mode with cross-scene references, we need data from all scenes
+        scenes_to_parse = self.all_available_scenes if (self.is_validation and hasattr(self, 'all_available_scenes')) else self.scenes
+        
+        for scene in scenes_to_parse:
+            scene_dir = os.path.join(root_dir, scene)
+            if not os.path.exists(scene_dir):
                 continue
                 
-            scene_name = os.path.basename(scene_folder)
-            image_files = glob.glob(os.path.join(scene_folder, '*'))
+            image_files = glob.glob(os.path.join(scene_dir, "*.jpg")) + \
+                         glob.glob(os.path.join(scene_dir, "*.png"))
             
-            # Group images by light position for this scene
-            light_groups = defaultdict(list)
-            
-            for img_file in image_files:
-                params = self._parse_filename(img_file)
-                if params is None:
+            scene_data = {}
+            for img_path in image_files:
+                try:
+                    filename = os.path.basename(img_path)
+                    # Parse filename: {index}_{group}_{pan}_{tilt}_{R}_{G}_{B}_{scene}_{camera_pos}_{light_color}_{light_pos}
+                    parts = filename.split('_')
+                    if len(parts) >= 11:
+                        light_color = parts[9]
+                        # Only use light color 1
+                        if light_color == '1':
+                            camera_pos = parts[8]
+                            light_pos = parts[10].split('.')[0]  # Remove file extension
+                            
+                            if camera_pos not in scene_data:
+                                scene_data[camera_pos] = {}
+                            if light_pos not in scene_data[camera_pos]:
+                                scene_data[camera_pos][light_pos] = []
+                            
+                            scene_data[camera_pos][light_pos].append(img_path)
+                            
+                            # Only add to all_images if it's from our target scenes
+                            if scene in self.scenes:
+                                self.all_images.append({
+                                    'path': img_path,
+                                    'scene': scene,
+                                    'camera_pos': camera_pos,
+                                    'light_pos': light_pos
+                                })
+                except (IndexError, ValueError) as e:
+                    print(f"Skipping invalid filename: {filename} - {e}")
                     continue
-                    
-                # Only use light color 1
-                if params['light_color'] not in self.light_colors:
-                    continue
-                    
-                light_pos = params['light_pos']
-                if light_pos in range(1, 10):  # Valid light positions 1-9
-                    light_groups[light_pos].append(img_file)
             
-            # Only keep scenes that have images for multiple light positions
-            valid_positions = [pos for pos, files in light_groups.items() if len(files) > 0]
-            if len(valid_positions) >= 2:
-                # Load images for valid positions
-                scene_data = {}
-                for pos in valid_positions:
-                    if light_groups[pos]:  # Take first image for each position
-                        img_path = light_groups[pos][0]
-                        try:
-                            img = Image.open(img_path).convert('RGB')
-                            scene_data[pos] = np.array(img)
-                        except Exception as e:
-                            print(f"Error loading {img_path}: {e}")
-                            continue
-                
-                if len(scene_data) >= 2:
-                    scene_images[scene_name] = scene_data
-                    
-        return scene_images
-    
-    def _get_opposing_position(self, light_pos):
-        """Get a random opposing light position"""
-        if light_pos in self.opposing_pairs:
-            available_opposites = []
-            for opp_pos in self.opposing_pairs[light_pos]:
-                # Check if we have an image for this opposing position in current scene
-                if opp_pos in self.current_scene_data:
-                    available_opposites.append(opp_pos)
-            
-            if available_opposites:
-                return np.random.choice(available_opposites)
+            if scene_data:
+                self.image_data[scene] = scene_data
         
-        # Fallback: return any available position that's not the input position
-        available_positions = [pos for pos in self.current_scene_data.keys() if pos != light_pos]
-        if available_positions:
-            return np.random.choice(available_positions)
+        if not self.all_images:
+            raise ValueError("No valid images found with light_color=1")
         
-        return None
-
+        print(f"Total valid images: {len(self.all_images)}")
+        print(f"Scenes with data: {list(self.image_data.keys())}")
+        
     def __len__(self):
-        return len(self.scene_images) * self.epoch_multiplier * 25
+        return len(self.all_images)
+    
+    def __getitem__(self, idx):
+        input_info = self.all_images[idx]
+        input_path = input_info['path']
+        input_scene = input_info['scene']
+        input_camera_pos = input_info['camera_pos']
+        input_light_pos = input_info['light_pos']
+        
+        # Load input image
+        input_img = Image.open(input_path).convert('RGB')
+        
+        if self.is_validation:
+            # VALIDATION MODE: Reference from DIFFERENT scenes for cross-scene evaluation
+            # Get all images from scenes different from input scene
+            cross_scene_images = []
+            for scene_name, scene_data in self.image_data.items():
+                if scene_name != input_scene:  # Different scene
+                    for cam_pos, cam_data in scene_data.items():
+                        for light_pos, img_paths in cam_data.items():
+                            for img_path in img_paths:
+                                cross_scene_images.append({
+                                    'path': img_path,
+                                    'scene': scene_name,
+                                    'camera_pos': cam_pos,
+                                    'light_pos': light_pos
+                                })
+            
+            if cross_scene_images:
+                ref_info = random.choice(cross_scene_images)
+                ref_path = ref_info['path']
+                ref_light_pos = ref_info['light_pos']
+            else:
+                # Fallback: use any available reference if no cross-scene images found
+                all_available_images = []
+                for scene_data in self.image_data.values():
+                    for cam_data in scene_data.values():
+                        for img_paths in cam_data.values():
+                            all_available_images.extend([{'path': p, 'light_pos': p.split('_')[10].split('.')[0]} for p in img_paths])
+                
+                if all_available_images:
+                    ref_info = random.choice(all_available_images)
+                    ref_path = ref_info['path']
+                    ref_light_pos = ref_info['light_pos']
+                else:
+                    ref_path = input_path
+                    ref_light_pos = input_light_pos
+                    print("Warning: No reference images found, using input as reference")
+            
+            # GT: Same scene and camera_pos as input, same light_pos as reference
+            gt_candidates = []
+            if (input_scene in self.image_data and 
+                input_camera_pos in self.image_data[input_scene] and 
+                ref_light_pos in self.image_data[input_scene][input_camera_pos]):
+                gt_candidates = self.image_data[input_scene][input_camera_pos][ref_light_pos]
+            
+            if gt_candidates:
+                gt_path = random.choice(gt_candidates)
+            else:
+                # Fallback: use input as GT if no matching GT found
+                gt_path = input_path
+                print(f"Warning: No GT found for scene={input_scene}, camera_pos={input_camera_pos}, light_pos={ref_light_pos}")
+            
+            # Load reference and GT images
+            ref_img = Image.open(ref_path).convert('RGB')
+            gt_img = Image.open(gt_path).convert('RGB')
+            
+            # Apply transforms
+            if self.single_img_transform is not None:
+                input_img = self.single_img_transform(input_img)
+                ref_img = self.single_img_transform(ref_img)
+                gt_img = self.single_img_transform(gt_img)
 
-    def __getitem__(self, index):
-        index = index % (len(self.scene_images) * 25)
-        scene_idx = index // 25
-        
-        scene_names = list(self.scene_images.keys())
-        scene_name = scene_names[scene_idx]
-        self.current_scene_data = self.scene_images[scene_name]
-        
-        # Get available light positions for this scene
-        available_positions = list(self.current_scene_data.keys())
-        
-        if len(available_positions) < 2:
-            # Fallback: use the same image twice (shouldn't happen with proper filtering)
-            pos1 = available_positions[0]
-            pos2 = pos1
+            if self.group_img_transform is not None:
+                input_img, ref_img, gt_img = self.group_img_transform([input_img, ref_img, gt_img])
+            
+            return input_img, ref_img, gt_img
+            
         else:
-            # Select random input position
-            pos1 = np.random.choice(available_positions)
+            # TRAINING MODE: Reference from same scene and camera_pos, different light_pos
+            ref_candidates = []
             
-            # Get opposing position
-            pos2 = self._get_opposing_position(pos1)
-            if pos2 is None:
-                # Fallback: select random different position
-                pos2 = np.random.choice([p for p in available_positions if p != pos1])
-        
-        # Load images
-        img1 = Image.fromarray(self.current_scene_data[pos1])
-        img2 = Image.fromarray(self.current_scene_data[pos2])
-        
-        # Apply transforms
-        img1 = self.single_img_transform(img1)
-        img2 = self.single_img_transform(img2)
-        
-        if self.group_img_transform is not None:
-            img1, img2 = self.group_img_transform([img1, img2])
+            if (input_scene in self.image_data and 
+                input_camera_pos in self.image_data[input_scene]):
+                
+                scene_camera_data = self.image_data[input_scene][input_camera_pos]
+                # Get all light positions except the current one
+                available_light_pos = [lp for lp in scene_camera_data.keys() if lp != input_light_pos]
+                
+                if available_light_pos:
+                    ref_light_pos = random.choice(available_light_pos)
+                    ref_candidates = scene_camera_data[ref_light_pos]
             
-        return img1, img2
-        
-def compute_rank_split(data_list, total_split, split_id):
-    """Split data list for distributed training"""
-    per_rank = len(data_list) // total_split
-    start_idx = split_id * per_rank
-    if split_id == total_split - 1:  # Last rank gets remaining data
-        end_idx = len(data_list)
-    else:
-        end_idx = start_idx + per_rank
-    return data_list[start_idx:end_idx]
+            if ref_candidates:
+                ref_path = random.choice(ref_candidates)
+            else:
+                # Fallback: use a random image from the same scene
+                scene_images = [img for img in self.all_images if img['scene'] == input_scene]
+                if scene_images:
+                    ref_info = random.choice(scene_images)
+                    ref_path = ref_info['path']
+                else:
+                    # Last resort: use input image
+                    ref_path = input_path
+                    print(f"Warning: Using input as reference for training - scene={input_scene}, camera_pos={input_camera_pos}")
+            
+            # Load reference image
+            ref_img = Image.open(ref_path).convert('RGB')
+            
+            # Apply transforms
+            if self.single_img_transform is not None:
+                input_img = self.single_img_transform(input_img)
+                ref_img = self.single_img_transform(ref_img)
+
+            if self.group_img_transform is not None:
+                input_img, ref_img = self.group_img_transform([input_img, ref_img])
+            
+            return input_img, ref_img

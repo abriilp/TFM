@@ -140,7 +140,7 @@ def create_image_grid(images, nrow=4, padding=2, normalize=True):
     return images
 
 
-def log_training_visualizations(input_img, ref_img, relit_img, step, mode='train', 
+def log_training_visualizations(input_img, ref_img, recon_img, step, mode='train', 
                                noisy_input_img=None, noisy_ref_img=None, max_images=4):
     """
     Log training/validation visualizations to wandb
@@ -162,7 +162,7 @@ def log_training_visualizations(input_img, ref_img, relit_img, step, mode='train
     # Select subset of images
     input_viz = input_img[:batch_size]
     ref_viz = ref_img[:batch_size]
-    recon_viz = relit_img[:batch_size]
+    recon_viz = recon_img[:batch_size]
     
     # Create image grids
     nrow = min(batch_size, 4)  # Max 4 images per row
@@ -175,7 +175,7 @@ def log_training_visualizations(input_img, ref_img, relit_img, step, mode='train
     wandb_images = {
         f'{mode}/input_images': wandb.Image(input_grid, caption=f'{mode.title()} Input Images'),
         f'{mode}/reference_images': wandb.Image(ref_grid, caption=f'{mode.title()} Reference Images'),
-        f'{mode}/relit_images': wandb.Image(recon_grid, caption=f'{mode.title()} Relit Images'),
+        f'{mode}/recon_images': wandb.Image(recon_grid, caption=f'{mode.title()} Relit Images'),
     }
     
     # Add noisy images if provided (training only)
@@ -193,7 +193,7 @@ def log_training_visualizations(input_img, ref_img, relit_img, step, mode='train
     
     # Create comparison grid (side by side)
     comparison_grid = create_comparison_grid(input_viz, ref_viz, recon_viz, nrow=nrow)
-    wandb_images[f'{mode}/comparison'] = wandb.Image(comparison_grid, caption=f'{mode.title()} Comparison: Input | Reference | Relit')
+    wandb_images[f'{mode}/comparison'] = wandb.Image(comparison_grid, caption=f'{mode.title()} Comparison: Input | Reference | Recon')
     
     # Log to wandb
     wandb.log(wandb_images, step=step)

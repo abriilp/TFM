@@ -338,10 +338,16 @@ def main_worker(gpu, ngpus_per_node, args):
         )
 
     elif args.dataset == 'rsr_256':
-        # Updated to use the new RelightingDataset with proper parameters
-        train_dataset = RSRDataset(args.data_path, transform_train, total_split = args.world_size, split_id = args.rank)
-        # For RSR, you might want to create a separate validation split or use a subset
-        val_dataset = RSRDataset(args.data_path, transform_val, total_split = args.world_size, split_id = args.rank)
+        # UPDATED: Use new RSRDataset with proper training/validation split
+        # Training dataset
+        train_dataset = RSRDataset(root_dir=args.data_path, 
+                          img_transform=transform_train, 
+                          is_validation=False)  # Uses all scenes except last 2
+
+        # Validation dataset
+        val_dataset = RSRDataset(root_dir=args.data_path, 
+                        img_transform=transform_val, 
+                        is_validation=True)  # Uses last 2 scenes, with cross-scene references
 
     print('NUM of training images: {}'.format(len(train_dataset)))
     print('NUM of validation images: {}'.format(len(val_dataset)))
@@ -380,7 +386,7 @@ def main_worker(gpu, ngpus_per_node, args):
         last_training_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args)
         
         # Validation (configurable frequency)
-        val_freq = getattr(args, 'validation_freq', 1)  # Default: validate every 5 epochs
+        val_freq = getattr(args, 'validation_freq', 1)  # Default: validate every epoch
         if epoch % val_freq == 0 or epoch == args.start_epoch:
             print(f"Running validation at epoch {epoch}")
             val_metrics = validate_D(val_loader, model, epoch, args, current_step=last_training_step)
@@ -467,15 +473,15 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
             mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
             intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]
 
-            relit_img = model([intrinsic_input, extrinsic_ref], run_encoder = False).float()
+            recon_img = model([intrinsic, extrinsic_ref], run_encoder = False).float()
 
         
         logdet_pred, logdet_target = logdet_loss(intrinsic_input)
         logdet_pred_ext, logdet_target_ext = logdet_loss([extrinsic_input])
         sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
-        rec_loss = nn.MSELoss()(relit_img,input_img)
-        ssim_component = 0.1 * (1 - ssim_loss(relit_img,input_img))
-        grad_component = gradient_loss(relit_img,input_img)
+        rec_loss = nn.MSELoss()(recon_img,input_img)
+        ssim_component = 0.1 * (1 - ssim_loss(recon_img,input_img))
+        grad_component = gradient_loss(recon_img,input_img)
 
         rec_loss_total = 10 * rec_loss + ssim_component + grad_component
         logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
@@ -526,7 +532,7 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
                 log_training_visualizations(
                     input_img=input_img,
                     ref_img=ref_img,
-                    relit_img=relit_img,
+                    recon_img=recon_img,
                     noisy_input_img=noisy_input_img,
                     noisy_ref_img=noisy_ref_img,
                     step=current_step,
@@ -544,16 +550,16 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
         t0 = time.time()
         torch.cuda.reset_peak_memory_stats()
 
-    if args.gpu == 0 and epoch % 5 == 0:
+    """if args.gpu == 0 and epoch % 5 == 0:
         target_img = ref_img[torch.randperm(input_img.shape[0]).to(args.gpu)]
         plot_relight_img_train(model, input_img, ref_img, target_img, args.save_folder_path + '/{:05d}_{:05d}_gen'.format(epoch + 1, i))
-
+    ARREGLAR,RuntimeError: shape '[2, 2, 3, 256, 256]' is invalid for input of size 3145728 """
     torch.distributed.barrier()
     return current_step
 
 
 def validate_D(val_loader, model, epoch, args, current_step=None):
-    """Validation function with visualizations"""
+    """Validation function with visualizations - UPDATED for 3-image validation"""
     from visu_utils import log_relighting_results
     
     model.eval()
@@ -564,10 +570,21 @@ def validate_D(val_loader, model, epoch, args, current_step=None):
         current_step = epoch * len(val_loader)
 
     with torch.no_grad():
-        for i, (input_img, ref_img, gt_img) in enumerate(val_loader):
+        print("Starting validation...")
+        print(f"Len Validation loader {len(val_loader)}")
+        for i, batch in enumerate(val_loader):
+            print(f"Validation batch {i}/{len(val_loader)}")
             val_step = current_step + i
-            if i >= getattr(args, 'max_val_batches', 5):  # Limit validation batches for speed
+            if i >= getattr(args, 'max_val_batches', 2):  # Limit validation batches for speed
                 break
+            
+            # UPDATED: Handle 3-image validation batch (input, ref, gt)
+            if len(batch) == 3:
+                input_img, ref_img, gt_img = batch
+            else:
+                # Fallback for 2-image case (shouldn't happen with validation dataset)
+                input_img, ref_img = batch
+                gt_img = ref_img  # Use ref as gt fallback
                 
             input_img = input_img.to(args.gpu)
             ref_img = ref_img.to(args.gpu)
@@ -577,22 +594,23 @@ def validate_D(val_loader, model, epoch, args, current_step=None):
             intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
             intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
             
-            # Simple relighting for validation
-            relit_img = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+            # UPDATED: Proper relighting for validation - use input intrinsics with ref extrinsics
+            relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
             
-            # Compute validation metrics
-            val_loss = nn.MSELoss()(relit_img, input_img)
+            # UPDATED: Compute validation metrics against ground truth
+            val_reconstruction_loss = nn.MSELoss()(relit_img, gt_img)
+            val_input_reconstruction = nn.MSELoss()(relit_img, input_img)  # For comparison
             
             if i == 0:  # Log metrics from first batch
                 val_metrics = {
-                    'val_reconstruction_loss': val_loss.item(),
+                    'val_reconstruction_loss_vs_gt': val_reconstruction_loss.item(),
+                    'val_reconstruction_loss_vs_input': val_input_reconstruction.item(),
                     'val_epoch': epoch,
                 }
             
             # Log validation visualizations
             if args.is_master and not args.disable_wandb and i in [0, 1]:  # Only first and second batch 
                 log_relighting_results(
-                    #model,
                     input_img=input_img,
                     ref_img=ref_img,
                     relit_img=relit_img,

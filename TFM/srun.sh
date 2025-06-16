@@ -22,7 +22,7 @@ echo "NODELIST="${SLURM_NODELIST}
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$master_addr
 echo "MASTER_ADDR="$MASTER_ADDR
-data_path=/home/apinyol/TFM/Data/multi_illumination_train_mip2_jpg
+data_path=/home/apinyol/TFM/Data/RSR_256 #_mini
 #/home/apinyol/TFM/Data/RSR_256
 #/home/apinyol/TFM/Data/iiw-dataset/data
 #/home/apinyol/TFM/Data/multi_illumination_train_mip2_jpg
@@ -32,14 +32,15 @@ python -m torch.distributed.launch \
 --data_path ${data_path} \
 --reg_weight 1e-4 \
 --intrinsics_loss_weight 1e-1 \
---epochs 5 \
---batch_size 4 \
+--epochs 50 \
+--batch_size 16 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
 --resume \
 --wandb_project "Latent_Intrinsics_Relighting" \
---wandb_run_name "mit_finetuning" \
+--wandb_run_name "rsr_256_finetuning (loss arreglada?)" \
 --resume \
---dataset mit \
+--dataset rsr_256 \
 #--visu_path /home/apinyol/TFM/Latent_Intrinsics/relight_result_proves1
  
+# "intrinsic relighting2" \
