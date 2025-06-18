@@ -43,10 +43,11 @@ from pytorch_ssim import SSIM as compute_SSIM_loss
 import wandb
 
 # Local application imports
-from utils import (
-    AverageMeter, ProgressMeter, init_ema_model, update_ema_model,
-    MIT_Dataset, affine_crop_resize, multi_affine_crop_resize, MIT_Dataset_PreLoad, IIW2
-)
+from utils import *
+#(
+#    AverageMeter, ProgressMeter, init_ema_model, update_ema_model,
+#    MIT_Dataset, affine_crop_resize, multi_affine_crop_resize, MIT_Dataset_PreLoad, IIW2
+#)
 from unets import UNet
 from model_utils import (
     plot_relight_img_train, compute_logdet_loss, intrinsic_loss, save_checkpoint
@@ -148,6 +149,11 @@ parser.add_argument('--test_ratio', type=float, default=0.2,
                        help='Ratio of scenes to use for testing (default: 0.2)')
 parser.add_argument('--random_seed', type=int, default=42,
                        help='Random seed for reproducible train/test splits (default: 42)')
+
+# Multi-dataset validation arguments
+#parser.add_argument('--validation_datasets', nargs='+', default=['mit', 'rsr_256'],
+#                    choices=['mit', 'rsr_256', 'iiw'],
+#                    help='List of datasets to validate on (default: mit rsr_256)')
 
 
 args = parser.parse_args()
@@ -258,6 +264,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # Add visualization config to wandb
             "viz_log_freq": getattr(args, 'viz_log_freq', 50),
             "max_viz_images": getattr(args, 'max_viz_images', 4),
+            # Add multi-dataset validation info
+            "validation_datasets": getattr(args, 'validation_datasets', ['mit', 'rsr_256']),
+            "training_dataset": args.dataset,
         }
 
         wandb.init(
@@ -352,6 +361,9 @@ def main_worker(gpu, ngpus_per_node, args):
     print('NUM of training images: {}'.format(len(train_dataset)))
     print('NUM of validation images: {}'.format(len(val_dataset)))
     
+    # UPDATED: Create multiple validation datasets for comparison
+    validation_datasets = create_validation_datasets(args, transform_val)
+    
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle = True, drop_last = True)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle = False, drop_last = False)
@@ -366,34 +378,37 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last = True, persistent_workers = True)
     
-    # Validation loader (typically smaller batch size)
-    val_batch_size = getattr(args, 'val_batch_size', args.batch_size)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=val_batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=False, sampler=val_sampler, drop_last = False, persistent_workers = True)
+    # UPDATED: Create validation loaders for all datasets
+    validation_loaders = create_validation_loaders(validation_datasets, args, val_sampler)
 
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed
             and args.is_master):
         if not os.path.exists(save_folder_path):
             os.system('mkdir -p {}'.format(save_folder_path))
 
+    # FIXED: Initialize global step counter
+    global_step = 0
+
     # Training loop with validation
     for epoch in range(args.start_epoch, args.epochs+args.start_epoch):
         if args.distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
-        # Training
-        last_training_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args)
+        # Training - FIXED: Update global step counter
+        last_training_step, global_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step)
         
-        # Validation (configurable frequency)
+        # UPDATED: Multi-dataset validation
         val_freq = getattr(args, 'validation_freq', 1)  # Default: validate every epoch
         if epoch % val_freq == 0 or epoch == args.start_epoch:
-            print(f"Running validation at epoch {epoch}")
-            val_metrics = validate_D(val_loader, model, epoch, args, current_step=last_training_step)
+            print(f"Running multi-dataset validation at epoch {epoch}")
+            # FIXED: Pass and update global step counter
+            all_val_metrics, global_step = validate_multi_datasets(validation_loaders, model, epoch, args, current_step=global_step)
             
-            # Log validation summary
-            if args.is_master and not args.disable_wandb and val_metrics:
-                print(f"Validation metrics at epoch {epoch}: {val_metrics}")
+            # Log validation summary for all datasets
+            if args.is_master and not args.disable_wandb and all_val_metrics:
+                print(f"Multi-dataset validation metrics at epoch {epoch}:")
+                for dataset_name, metrics in all_val_metrics.items():
+                    print(f"  {dataset_name}: {metrics}")
         
         # Checkpointing
         if args.is_master:
@@ -418,6 +433,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.is_master and not args.disable_wandb:
         wandb.finish()
 
+
 def print_gradients(model):
     max_grad = 0
     max_norm = 0
@@ -427,7 +443,8 @@ def print_gradients(model):
             max_norm = max(max_norm, p.data.norm(2))
     return max_grad, max_norm
 
-def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
+def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step):
+    """FIXED: Modified to accept and return global_step"""
     loss_name = [
                 'loss','logdet', 'light_logdet', 'intrinsic_sim',
                 'GPU Mem', 'Time', 'pe', 'ge']
@@ -448,9 +465,6 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
 
     # Import visualization utilities
     from visu_utils import log_training_visualizations
-
-    # Global step counter for wandb logging
-    global_step = epoch * len(train_loader)
 
     for i, (input_img, ref_img) in enumerate(train_loader):
         current_step = global_step + i
@@ -555,25 +569,29 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args):
         plot_relight_img_train(model, input_img, ref_img, target_img, args.save_folder_path + '/{:05d}_{:05d}_gen'.format(epoch + 1, i))
     ARREGLAR,RuntimeError: shape '[2, 2, 3, 256, 256]' is invalid for input of size 3145728 """
     torch.distributed.barrier()
-    return current_step
+    
+    # FIXED: Return the updated global step
+    final_step = global_step + len(train_loader)
+    return current_step, final_step
 
 
-def validate_D(val_loader, model, epoch, args, current_step=None):
-    """Validation function with visualizations - UPDATED for 3-image validation"""
+def validate_D(val_loader, model, epoch, args, current_step=None, dataset_name='validation'):
+    """Validation function with visualizations - UPDATED for 3-image validation
+    FIXED: Modified to accept current_step, dataset_name and return next_step"""
     from visu_utils import log_relighting_results
     
     model.eval()
     val_metrics = {}
     
-    # Global step counter for wandb logging
+    # FIXED: Use provided current_step directly
     if current_step is None:
-        current_step = epoch * len(val_loader)
+        current_step = 0
 
     with torch.no_grad():
-        print("Starting validation...")
+        print(f"Starting validation on {dataset_name}...")
         print(f"Len Validation loader {len(val_loader)}")
         for i, batch in enumerate(val_loader):
-            print(f"Validation batch {i}/{len(val_loader)}")
+            print(f"Validation batch {i}/{len(val_loader)} for {dataset_name}")
             val_step = current_step + i
             if i >= getattr(args, 'max_val_batches', 2):  # Limit validation batches for speed
                 break
@@ -608,7 +626,7 @@ def validate_D(val_loader, model, epoch, args, current_step=None):
                     'val_epoch': epoch,
                 }
             
-            # Log validation visualizations
+            # UPDATED: Log validation visualizations with dataset-specific prefix
             if args.is_master and not args.disable_wandb and i in [0, 1]:  # Only first and second batch 
                 log_relighting_results(
                     input_img=input_img,
@@ -616,14 +634,44 @@ def validate_D(val_loader, model, epoch, args, current_step=None):
                     relit_img=relit_img,
                     gt_img=gt_img,
                     step=val_step,
-                    mode='validation'
+                    mode=f'{dataset_name}_validation'  # Dataset-specific mode
                 )
                 
                 if val_metrics:
                     wandb.log(val_metrics, step=val_step)
     
     model.train()
-    return val_metrics
+    
+    # FIXED: Return metrics and next step
+    next_step = current_step + min(len(val_loader), getattr(args, 'max_val_batches', 2))
+    return val_metrics, next_step
+
+
+def validate_multi_datasets(validation_loaders, model, epoch, args, current_step=None):
+    """FIXED: Multi-dataset validation with proper step tracking and separate image logging"""
+    all_val_metrics = {}
+    
+    if current_step is None:
+        current_step = 0
+    
+    for dataset_name, val_loader in validation_loaders.items():
+        print(f"Validating on {dataset_name} dataset...")
+        
+        # FIXED: Pass current_step and dataset_name for separate image logging
+        val_metrics, current_step = validate_D(val_loader, model, epoch, args, 
+                                             current_step=current_step, 
+                                             dataset_name=dataset_name)
+        
+        # Add dataset prefix to metrics
+        prefixed_metrics = {f"{dataset_name}_{k}": v for k, v in val_metrics.items()}
+        all_val_metrics[dataset_name] = prefixed_metrics
+        
+        # Log dataset-specific metrics
+        if args.is_master and not args.disable_wandb:
+            wandb.log(prefixed_metrics, step=current_step-1)  # Use the last step from this dataset
+    
+    return all_val_metrics, current_step
+
 
 if __name__ == '__main__':
     main()

@@ -38,9 +38,11 @@ python -m torch.distributed.launch \
 --weight_decay 1e-2 \
 --resume \
 --wandb_project "Latent_Intrinsics_Relighting" \
---wandb_run_name "rsr_256_finetuning (loss arreglada?)" \
+--wandb_run_name "finetuning rsr - val rsr and mit" \
 --resume \
 --dataset rsr_256 \
+#
 #--visu_path /home/apinyol/TFM/Latent_Intrinsics/relight_result_proves1
  
 # "intrinsic relighting2" \
+#"Latent_Intrinsics_Relighting" \

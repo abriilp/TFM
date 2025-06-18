@@ -17,6 +17,52 @@ F = torch.nn.functional
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+# Standard library imports
+import argparse
+import builtins
+import copy
+import glob
+import json
+import math
+import os
+import pdb
+import random
+import shutil
+import time
+from typing import Union, List, Optional, Callable
+
+# Third-party imports
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision
+import torchvision.models as models
+import torchvision.transforms as transforms
+import warnings
+from PIL import Image
+from torch import autograd
+from torch.optim import AdamW
+from tqdm import tqdm
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+# Third-party loss/metrics
+from pytorch_losses import gradient_loss
+from pytorch_ssim import SSIM as compute_SSIM_loss
+
+from dataset_utils import *
+
+# wandb import
+import wandb
+
 class affine_crop_resize(torchvision.transforms.RandomResizedCrop):
     def __init__(self, size, flip = True, **kargs):
         self.size = size
@@ -368,7 +414,7 @@ class MIT_Dataset(data.Dataset):
 
         if self.group_img_transform is not None:
             img1, img2, img3 = self.group_img_transform([img1, img2, img3])
-        return img1, img2, img3
+        return img1, img3, img2
 
 class MIT_Dataset_show(data.Dataset):
     def __init__(self, root, img_transform, epoch_multiplier = 10,
@@ -597,3 +643,152 @@ class ProgressMeter(object):
         num_digits = len(str(num_batches // 1))
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+
+
+
+
+# Validation utils abril
+def create_validation_datasets(args, transform_val):
+    """Create validation datasets for multiple datasets"""
+    validation_datasets = {}
+    
+    # Get validation datasets to create (default to MIT and RSR_256)
+    val_datasets = getattr(args, 'validation_datasets', ['mit', 'rsr_256'])
+    
+    for dataset_name in val_datasets:
+        print(f"Creating validation dataset for: {dataset_name}")
+        
+        if dataset_name == 'mit':
+            val_dataset = MIT_Dataset('/home/apinyol/TFM/Data/multi_illumination_test_mip2_jpg', 
+                                     transform_val, eval_mode=True)
+            validation_datasets['MIT'] = val_dataset
+            
+        elif dataset_name == 'rsr_256':
+            # Use RSR validation path - you might need to adjust this path
+            rsr_val_path = getattr(args, 'rsr_val_path', args.data_path if hasattr(args, 'data_path') else '/home/apinyol/TFM/Data/RSR_256')
+            val_dataset = RSRDataset(root_dir=rsr_val_path, 
+                                   img_transform=transform_val, 
+                                   is_validation=True)
+            validation_datasets['RSR_256'] = val_dataset
+            
+        elif dataset_name == 'iiw':
+            # Add IIW validation if needed
+            iiw_val_path = getattr(args, 'iiw_val_path', '/path/to/iiw/data')
+            val_dataset = IIW2(root=iiw_val_path,
+                              img_transform=transform_val,
+                              split='val',
+                              return_two_images=True)
+            validation_datasets['IIW'] = val_dataset
+    
+    # Print dataset sizes
+    for name, dataset in validation_datasets.items():
+        print(f'NUM of {name} validation images: {len(dataset)}')
+    
+    return validation_datasets
+
+
+def create_validation_loaders(validation_datasets, args, val_sampler):
+    """Create validation data loaders for all datasets"""
+    validation_loaders = {}
+    val_batch_size = getattr(args, 'val_batch_size', args.batch_size)
+    
+    for dataset_name, dataset in validation_datasets.items():
+        val_loader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=val_batch_size, 
+            shuffle=False,
+            num_workers=args.workers, 
+            pin_memory=False, 
+            sampler=val_sampler, 
+            drop_last=False, 
+            persistent_workers=True
+        )
+        validation_loaders[dataset_name] = val_loader
+    
+    return validation_loaders
+
+
+def validate_multi_datasets(validation_loaders, model, epoch, args, current_step=None):
+    """Validate on multiple datasets and log results separately"""
+    from visu_utils import log_relighting_results
+    
+    model.eval()
+    all_val_metrics = {}
+    
+    # Global step counter for wandb logging
+    if current_step is None:
+        current_step = epoch * sum(len(loader) for loader in validation_loaders.values())
+
+    with torch.no_grad():
+        step_offset = 0
+        
+        for dataset_name, val_loader in validation_loaders.items():
+            print(f"Validating on {dataset_name} dataset...")
+            dataset_metrics = {}
+            
+            # Track metrics across batches
+            reconstruction_losses = []
+            input_reconstruction_losses = []
+            
+            for i, batch in enumerate(val_loader):
+                val_step = current_step + step_offset + i
+                if i >= getattr(args, 'max_val_batches', 3):  # Limit validation batches for speed
+                    break
+                
+                # Handle different batch formats
+                if len(batch) == 3:
+                    input_img, ref_img, gt_img = batch
+                else:
+                    # Fallback for 2-image case
+                    input_img, ref_img = batch
+                    gt_img = ref_img  # Use ref as gt fallback
+                    
+                input_img = input_img.to(args.gpu)
+                ref_img = ref_img.to(args.gpu)
+                gt_img = gt_img.to(args.gpu)
+                
+                # Forward pass without noise for validation
+                intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
+                intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
+                
+                # Proper relighting for validation - use input intrinsics with ref extrinsics
+                relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
+                
+                # Compute validation metrics against ground truth
+                val_reconstruction_loss = nn.MSELoss()(relit_img, gt_img)
+                val_input_reconstruction = nn.MSELoss()(relit_img, input_img)  # For comparison
+                
+                reconstruction_losses.append(val_reconstruction_loss.item())
+                input_reconstruction_losses.append(val_input_reconstruction.item())
+                
+                # Log validation visualizations (only for first batch of each dataset)
+                if args.is_master and not args.disable_wandb and i == 0:
+                    log_relighting_results(
+                        input_img=input_img,
+                        ref_img=ref_img,
+                        relit_img=relit_img,
+                        gt_img=gt_img,
+                        step=val_step,
+                        mode=f'validation_{dataset_name.lower()}'
+                    )
+            
+            # Aggregate metrics for this dataset
+            if reconstruction_losses:
+                dataset_metrics = {
+                    f'val_{dataset_name.lower()}_reconstruction_loss_vs_gt': sum(reconstruction_losses) / len(reconstruction_losses),
+                    f'val_{dataset_name.lower()}_reconstruction_loss_vs_input': sum(input_reconstruction_losses) / len(input_reconstruction_losses),
+                    f'val_{dataset_name.lower()}_epoch': epoch,
+                    f'val_{dataset_name.lower()}_num_batches': len(reconstruction_losses),
+                }
+                
+                all_val_metrics[dataset_name] = dataset_metrics
+                
+                # Log to wandb with dataset-specific prefix
+                if args.is_master and not args.disable_wandb:
+                    wandb.log(dataset_metrics, step=current_step + step_offset)
+            
+            step_offset += len(val_loader)
+    
+    model.train()
+    return all_val_metrics
