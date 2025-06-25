@@ -36,13 +36,35 @@ python -m torch.distributed.launch \
 --batch_size 16 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
---resume \
 --wandb_project "Latent_Intrinsics_Relighting" \
---wandb_run_name "finetuning rsr - val rsr and mit" \
---resume \
+--wandb_run_name "rsr finetuning + depth loss" \
 --dataset rsr_256 \
-#
-#--visu_path /home/apinyol/TFM/Latent_Intrinsics/relight_result_proves1
+--experiment_name "rsr_f_dl" \
+--enable_depth_loss \
+--depth_loss_weight 10.0 \
+--resume_from /home/apinyol/TFM/Models/Latent_Intrinsics/last.pth.tar \
+
+#--resume_from /home/apinyol/TFM/Models/Latent_Intrinsics/last.pth.tar \
+
+# Start new experiment
+#--experiment_name "depth_ablation" --learning_rate 0.001
+#--experiment_name "rsr_f_dl" dataset_scratch(s)/finetuning(f)_depthloss(dl)/no_depthloss(ndl) 
+
+# Resume from latest checkpoint automatically  
+#--experiment_name "depth_ablation" --auto_resume
+
+# Resume from specific checkpoint
+#--resume_from ./checkpoints/intrinsics_experiment_20250618_143052_a1b2c3d4/epoch_0050.pth
+
+# Keep only last 5 checkpoints, save every 10 epochs
+#--keep_last 5 --save_every 10
+
+
+# Depth params
+# --enable_depth_loss \
+# --depth_loss_weight 1e-2 \
+# --depth_model_name "depth-anything/Depth-Anything-V2-Small-hf
  
+ #wandb projecs: 
 # "intrinsic relighting2" \
 #"Latent_Intrinsics_Relighting" \

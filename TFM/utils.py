@@ -792,3 +792,435 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
     
     model.train()
     return all_val_metrics
+
+
+
+
+
+# checkpoint management abril
+
+def create_experiment_folder(args):
+    """Create a unique experiment folder with timestamp and run ID"""
+    import datetime
+    import uuid
+    
+    # Create base checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Generate timestamp and short run ID
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = str(uuid.uuid4())[:8]
+    
+    # Create experiment folder name
+    experiment_folder = f"{args.experiment_name}_{timestamp}_{run_id}"
+    
+    # Create full path
+    experiment_path = os.path.join(args.checkpoint_dir, experiment_folder)
+    os.makedirs(experiment_path, exist_ok=True)
+    
+    # Save experiment config
+    config_path = os.path.join(experiment_path, "config.json")
+    config = {
+        "experiment_name": args.experiment_name,
+        "timestamp": timestamp,
+        "run_id": run_id,
+        "hyperparameters": {
+            "learning_rate": args.learning_rate,
+            "intrinsics_loss_weight": args.intrinsics_loss_weight,
+            "reg_weight": args.reg_weight,
+            "batch_size": args.batch_size,
+            "weight_decay": args.weight_decay,
+            "affine_scale": args.affine_scale,
+            "img_size": args.img_size,
+            "epochs": args.epochs,
+            "enable_depth_loss": args.enable_depth_loss,
+            "dataset": args.dataset,
+        }
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"Created experiment folder: {experiment_path}")
+    return experiment_path
+
+def find_latest_checkpoint(experiment_path):
+    """Find the latest checkpoint in the experiment folder"""
+    checkpoint_files = glob.glob(os.path.join(experiment_path, "epoch_*.pth"))
+    if not checkpoint_files:
+        return None
+    
+    # Sort by epoch number
+    checkpoint_files.sort(key=lambda x: int(x.split('epoch_')[1].split('.pth')[0]))
+    return checkpoint_files[-1]
+
+def find_experiment_folder(args):
+    """Find experiment folder for resuming"""
+    if args.resume_from and args.is_master:
+        if os.path.isfile(args.resume_from):
+            return create_experiment_folder(args), args.resume_from
+        else:
+            print(f"Resume path not found: {args.resume_from}")
+            return None, None
+    
+    if args.auto_resume:
+        # Find latest experiment folder with same experiment name
+        experiment_folders = glob.glob(os.path.join(args.checkpoint_dir, f"{args.experiment_name}_*"))
+        if experiment_folders:
+            latest_folder = max(experiment_folders, key=os.path.getctime)
+            latest_checkpoint = find_latest_checkpoint(latest_folder)
+            if latest_checkpoint:
+                return latest_folder, latest_checkpoint
+    
+    return None, None
+
+def cleanup_old_checkpoints(experiment_path, keep_last=3):
+    """Remove old checkpoints, keeping only the last N"""
+    if keep_last <= 0:
+        return
+    
+    checkpoint_files = glob.glob(os.path.join(experiment_path, "epoch_*.pth"))
+    if len(checkpoint_files) <= keep_last:
+        return
+    
+    # Sort by epoch number
+    checkpoint_files.sort(key=lambda x: int(x.split('epoch_')[1].split('.pth')[0]))
+    
+    # Remove old checkpoints
+    for old_checkpoint in checkpoint_files[:-keep_last]:
+        try:
+            os.remove(old_checkpoint)
+            print(f"Removed old checkpoint: {os.path.basename(old_checkpoint)}")
+        except OSError:
+            pass
+
+def save_checkpoint_improved(state, experiment_path, epoch, is_best=False, keep_last=3):
+    """Save checkpoint with better naming and cleanup"""
+    # Save epoch checkpoint
+    epoch_filename = os.path.join(experiment_path, f"epoch_{epoch:04d}.pth")
+    torch.save(state, epoch_filename)
+    
+    # Save as latest
+    latest_filename = os.path.join(experiment_path, "latest.pth")
+    torch.save(state, latest_filename)
+    
+    # Save as best if specified
+    if is_best:
+        best_filename = os.path.join(experiment_path, "best.pth")
+        torch.save(state, best_filename)
+    
+    # Cleanup old checkpoints
+    cleanup_old_checkpoints(experiment_path, keep_last)
+    
+    print(f"Saved checkpoint: epoch_{epoch:04d}.pth")
+
+def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scaler, args):
+    """Load checkpoint with error handling"""
+    if not os.path.isfile(checkpoint_path):
+        print(f"No checkpoint found at: {checkpoint_path}")
+        return 0
+    
+    print(f"Loading checkpoint: {checkpoint_path}")
+    
+    try:
+        if args.gpu is None:
+            checkpoint = torch.load(checkpoint_path)
+        else:
+            loc = f'cuda:{args.gpu}'
+            checkpoint = torch.load(checkpoint_path, map_location=loc)
+        
+        start_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['state_dict'])
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scaler.load_state_dict(checkpoint['scaler'])
+        
+        print(f"Loaded checkpoint from epoch {start_epoch}")
+        return start_epoch
+        
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return 0
+    
+
+
+    #depth
+
+class DepthConsistencyLoss(torch.nn.Module):
+    """Clean depth consistency loss with simple visualization"""
+    
+    def __init__(self, model_name="depth-anything/Depth-Anything-V2-Small-hf", device='cuda'):
+        super().__init__()
+        self.device = device
+        
+        # Load Depth Anything model
+        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        self.depth_model = AutoModelForDepthEstimation.from_pretrained(model_name)
+        self.depth_model.to(device)
+        self.depth_model.eval()
+        
+        # Freeze depth model parameters
+        for param in self.depth_model.parameters():
+            param.requires_grad = False
+
+    def forward(self, img1, img2):
+        """
+        Compute depth consistency loss between two images
+        img1, img2: (B, C, H, W) in range [-1, 1]
+        """
+        depth1 = self.get_depth_map(img1.detach())
+        depth2 = self.get_depth_map(img2)
+        
+        # Normalize depth maps to [0, 1] for better comparison
+        depth1_norm = self.normalize_depth_maps(depth1)
+        depth2_norm = self.normalize_depth_maps(depth2)
+        
+        # Compute L1 loss between depth maps
+        depth_loss = F.l1_loss(depth1_norm, depth2_norm)
+        
+        return depth_loss, depth1_norm, depth2_norm
+    
+    def preprocess_image(self, img_tensor):
+        """Convert tensor from [-1, 1] to [0, 255] and prepare for depth model"""
+        # Convert from [-1, 1] to [0, 1]
+        img_normalized = (img_tensor + 1.0) / 2.0
+        # Convert to [0, 255]
+        img_255 = (img_normalized * 255.0).clamp(0, 255)
+        
+        # Convert to PIL format for processor (B, H, W, C)
+        img_pil_format = img_255.permute(0, 2, 3, 1).detach().cpu().numpy().astype('uint8')
+        
+        return img_pil_format
+    
+    def get_depth_map(self, img_tensor):
+        """Get depth map from image tensor"""
+        batch_size = img_tensor.shape[0]
+        original_device = img_tensor.device
+        
+        # Detach input for depth estimation
+        with torch.no_grad():
+            img_array = self.preprocess_image(img_tensor)
+        
+        depth_maps = []
+        
+        with torch.no_grad():
+            for i in range(batch_size):
+                # Process single image
+                inputs = self.processor(images=img_array[i], return_tensors="pt")
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                # Get depth prediction
+                outputs = self.depth_model(**inputs)
+                depth = outputs.predicted_depth
+                
+                # Resize depth to match input image size
+                depth_resized = F.interpolate(
+                    depth.unsqueeze(1), 
+                    size=img_tensor.shape[2:], 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                
+                depth_maps.append(depth_resized)
+        
+        # Concatenate and ensure it's on the original device
+        depth_result = torch.cat(depth_maps, dim=0)
+        return depth_result.to(original_device)
+    
+    def normalize_depth_maps(self, depth_maps):
+        """Normalize depth maps to [0, 1] per image"""
+        normalized = torch.zeros_like(depth_maps)
+        for i in range(depth_maps.shape[0]):
+            d = depth_maps[i]
+            d_min, d_max = d.min(), d.max()
+            if d_max > d_min:
+                normalized[i] = (d - d_min) / (d_max - d_min)
+            else:
+                normalized[i] = d
+        return normalized
+    
+    def create_simple_visualization(self, input_img, relit_img, input_depth, relit_depth, epoch, dataset_name='validation'):
+        """Create simple visualization with input/relit images and their depths"""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            import numpy as np
+            
+            # Take first image from batch for visualization
+            input_vis = self.tensor_to_numpy(input_img[0])
+            relit_vis = self.tensor_to_numpy(relit_img[0])
+            input_depth_vis = input_depth[0, 0].cpu().numpy()
+            relit_depth_vis = relit_depth[0, 0].cpu().numpy()
+            
+            # Create 2x2 grid
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            fig.suptitle(f'{dataset_name} - Depth Comparison (Epoch {epoch})', fontsize=14, fontweight='bold')
+            
+            # Input image
+            axes[0, 0].imshow(input_vis)
+            axes[0, 0].set_title('Input Image')
+            axes[0, 0].axis('off')
+            
+            # Relit image
+            axes[0, 1].imshow(relit_vis)
+            axes[0, 1].set_title('Relit Image')
+            axes[0, 1].axis('off')
+            
+            # Input depth
+            im1 = axes[1, 0].imshow(input_depth_vis, cmap='plasma')
+            axes[1, 0].set_title('Input Depth')
+            axes[1, 0].axis('off')
+            plt.colorbar(im1, ax=axes[1, 0], fraction=0.046, pad=0.04)
+            
+            # Relit depth
+            im2 = axes[1, 1].imshow(relit_depth_vis, cmap='plasma')
+            axes[1, 1].set_title('Relit Depth')
+            axes[1, 1].axis('off')
+            plt.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
+            
+            plt.tight_layout()
+            
+            # Convert to image for wandb - Fixed method
+            fig.canvas.draw()
+            
+            # Try different methods based on matplotlib version
+            try:
+                # Modern matplotlib (3.3+)
+                buf = fig.canvas.buffer_rgba()
+                buf = np.asarray(buf)
+                # Convert RGBA to RGB
+                buf = buf[:, :, :3]
+            except AttributeError:
+                try:
+                    # Older matplotlib versions
+                    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                except AttributeError:
+                    # Fallback method
+                    import io
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+                    buf.seek(0)
+                    from PIL import Image
+                    img = Image.open(buf)
+                    buf = np.array(img)
+                    if buf.shape[-1] == 4:  # Remove alpha channel if present
+                        buf = buf[:, :, :3]
+            
+            plt.close()
+            return buf
+            
+        except Exception as e:
+            print(f"Warning: Visualization failed: {e}")
+            import traceback
+            traceback.print_exc()  # This will help debug the exact error
+            return None
+    
+    def tensor_to_numpy(self, tensor):
+        """Convert tensor to numpy for visualization"""
+        if tensor.dim() == 4:
+            tensor = tensor[0]
+        
+        # Denormalize from [-1, 1] to [0, 1]
+        tensor = (tensor + 1) / 2
+        tensor = torch.clamp(tensor, 0, 1)
+        
+        return tensor.permute(1, 2, 0).cpu().numpy()
+
+
+
+def analyze_depth_differences(model, val_loader, args, epoch, max_batches=None):
+    """
+    Function to integrate into your training loop for depth analysis
+    Uses the same DepthConsistencyLoss class for both loss computation and analysis
+    """
+    print("🔍 Starting comprehensive depth analysis...")
+    
+    # Initialize the enhanced depth consistency loss (same as used in training)
+    depth_analyzer = DepthConsistencyLoss(
+        model_name=getattr(args, 'depth_model_name', 'depth-anything/Depth-Anything-V2-Small-hf'),
+        device=args.gpu
+    )
+    
+    # Collect images from validation loader (ALL images if max_batches is None)
+    all_relit_imgs = []
+    all_gt_imgs = []
+    all_original_imgs = []
+    all_reference_imgs = []
+    
+    model.eval()
+    with torch.no_grad():
+        total_batches = len(val_loader) if max_batches is None else max_batches
+        for batch_idx, (img1, img2, img3) in enumerate(tqdm(val_loader, desc="Collecting validation images", total=total_batches)):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+                
+            img1 = img1.to(args.gpu)  # input/original
+            img2 = img2.to(args.gpu)  # target/gt
+            img3 = img3.to(args.gpu)  # reference lighting
+
+            # Generate relit images
+            intrinsic1, extrinsic1 = model(img1, run_encoder=True)
+            intrinsic3, extrinsic3 = model(img3, run_encoder=True)
+            relight_img2 = model([intrinsic1, extrinsic3], run_encoder=False).clamp(-1, 1)
+            
+            # Bias correction
+            shift = (relight_img2 - img2).mean(dim=[2, 3], keepdim=True)
+            correct_relight_img2 = relight_img2 - shift
+            
+            all_relit_imgs.append(correct_relight_img2)  # Keep on GPU
+            all_gt_imgs.append(img2)  # Keep on GPU
+            all_original_imgs.append(img1)  # Keep on GPU
+            all_reference_imgs.append(img3)  # Keep on GPU
+    
+    if len(all_relit_imgs) == 0:
+        print("No validation images collected!")
+        return None
+    
+    # Concatenate all images (keep on GPU for efficiency)
+    relit_imgs = torch.cat(all_relit_imgs, dim=0)
+    gt_imgs = torch.cat(all_gt_imgs, dim=0)
+    original_imgs = torch.cat(all_original_imgs, dim=0)
+    reference_imgs = torch.cat(all_reference_imgs, dim=0)
+    
+    print(f"Analyzing {relit_imgs.shape[0]} image pairs on GPU...")
+    
+    # Create output directory
+    analysis_dir = os.path.join(args.save_folder_path, f'depth_analysis_epoch_{epoch}')
+    
+    # Run comprehensive analysis (all images for stats, worst 8 for detailed analysis)
+    metrics = depth_analyzer.create_comprehensive_visualization(
+        relit_imgs, gt_imgs, original_imgs, reference_imgs, analysis_dir, 
+        max_images=8,  # Only for detailed analysis
+        analyze_worst=True
+    )
+    
+    print(f"✓ Depth analysis complete! Results saved to: {analysis_dir}")
+    print(f"📊 Analyzed {len(metrics['mse_per_image'])} images total")
+    print(f"📊 Average depth MSE: {metrics['avg_mse']:.6f}")
+    print(f"📊 Average depth SSIM: {metrics['avg_ssim']:.4f}")
+    print(f"📊 Worst MSE: {max(metrics['mse_per_image']):.6f}")
+    print(f"📊 Best MSE: {min(metrics['mse_per_image']):.6f}")
+    
+    # Log to wandb if available
+    if hasattr(args, 'is_master') and args.is_master and not getattr(args, 'disable_wandb', False):
+        try:
+            import wandb
+            wandb.log({
+                'depth_analysis/total_images_analyzed': len(metrics['mse_per_image']),
+                'depth_analysis/avg_mse': metrics['avg_mse'],
+                'depth_analysis/avg_mae': metrics['avg_mae'],
+                'depth_analysis/avg_ssim': metrics['avg_ssim'],
+                'depth_analysis/avg_gradient_error': metrics['avg_gradient_error'],
+                'depth_analysis/worst_mse': max(metrics['mse_per_image']),
+                'depth_analysis/best_mse': min(metrics['mse_per_image']),
+                'depth_analysis/mse_std': np.std(metrics['mse_per_image']),
+                'depth_analysis/worst_ssim': min(metrics['ssim_per_image']),
+                'depth_analysis/best_ssim': max(metrics['ssim_per_image']),
+                'epoch': epoch
+            })
+        except:
+            print("Could not log to wandb")
+    
+    model.train()
+    return metrics

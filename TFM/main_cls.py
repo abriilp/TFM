@@ -15,6 +15,8 @@ from typing import Union, List, Optional, Callable
 # Third-party imports
 import cv2
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -59,7 +61,6 @@ from eval_utils import get_eval_relight_dataloder
 
 # - dataset imports
 from dataset_utils import *
-
 
 
 #from sklearn.metrics import average_precision_score
@@ -132,14 +133,6 @@ parser.add_argument('--log_freq', default=10, type=int,
 # Path to save visu
 parser.add_argument("--visu_path", type=str, default=".", help="Path to save visualization images")
 
-# Depth params
-parser.add_argument("--depth_loss_weight", type=float, default=1e-2,
-                    help="Weight for depth consistency loss")
-parser.add_argument("--depth_model_name", type=str, default="depth-anything/Depth-Anything-V2-Small-hf",
-                    help="Depth Anything model variant")
-parser.add_argument("--enable_depth_loss", action='store_true',
-                    help="Enable depth consistency loss")
-
 # Dataset params
 parser.add_argument('--dataset', default='mit', choices=['mit', 'rsr_256', 'iiw'], 
                     help='Dataset type to use for training')
@@ -155,6 +148,27 @@ parser.add_argument('--random_seed', type=int, default=42,
 #                    choices=['mit', 'rsr_256', 'iiw'],
 #                    help='List of datasets to validate on (default: mit rsr_256)')
 
+# arguments for better checkpoint management
+parser.add_argument("--experiment_name", type=str, default="intrinsics_experiment",
+                    help="Base name for the experiment")
+parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
+                    help="Base directory for saving checkpoints")
+parser.add_argument("--resume_from", type=str, default=None,
+                    help="Specific checkpoint path to resume from (overrides auto-resume)")
+parser.add_argument("--auto_resume", action='store_true',
+                    help="Automatically resume from latest checkpoint in experiment")
+parser.add_argument("--save_every", type=int, default=5,
+                    help="Save checkpoint every N epochs")
+parser.add_argument("--keep_last", type=int, default=3,
+                    help="Keep only the last N checkpoints (0 to keep all)")
+
+# Depth params
+parser.add_argument("--depth_loss_weight", type=float, default=1e-2,
+                    help="Weight for depth consistency loss")
+parser.add_argument("--depth_model_name", type=str, default="depth-anything/Depth-Anything-V2-Small-hf",
+                    help="Depth Anything model variant")
+parser.add_argument("--enable_depth_loss", action='store_true',
+                    help="Enable depth consistency loss")
 
 args = parser.parse_args()
 
@@ -173,7 +187,15 @@ def init_model(args):
     init_ema_model(model, ema_model)
     optimizer = AdamW(model.parameters(),
                 lr= args.learning_rate, weight_decay = args.weight_decay)
-    return model, ema_model, optimizer
+    
+    depth_loss_fn = None
+    if args.enable_depth_loss:
+        depth_loss_fn = DepthConsistencyLoss(
+            model_name=args.depth_model_name, 
+            device=args.gpu
+        )
+
+    return model, ema_model, optimizer, depth_loss_fn
 
 def main():
     torch.manual_seed(2)
@@ -231,23 +253,37 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     args = copy.deepcopy(args)
     args.cos = True
-    save_folder_path = '''checkpoint/intrinsics_loss_weight_{}_reg_weight_{}_lr_{}_batch_size_{}_weight_decay_{}_affine_scale_{}'''.replace('\n',' ').replace(' ','').format(
-                        args.intrinsics_loss_weight, args.reg_weight, args.learning_rate, args.batch_size, args.weight_decay, args.affine_scale)
-    args.save_folder_path = save_folder_path
     args.is_master = args.rank == 0
 
+    # Create or find experiment folder
+    if args.resume or args.auto_resume or args.resume_from:
+        experiment_path, checkpoint_path = find_experiment_folder(args)
+        if experiment_path is None:
+            if args.is_master:
+                print("No checkpoint found for resuming, starting new experiment")
+                experiment_path = create_experiment_folder(args)
+                checkpoint_path = None
+    else:
+        if args.is_master:
+            experiment_path = create_experiment_folder(args)
+            checkpoint_path = None
+
+    args.save_folder_path = experiment_path
+    
     # Apply visualization configuration
     from visu_utils import apply_visualization_config
     args = apply_visualization_config(args, getattr(args, 'viz_config', 'standard'))
 
-    # Initialize WandB with depth loss config
+    # Initialize WandB
     if args.is_master and not args.disable_wandb:
         if args.wandb_run_name is None:
-            args.wandb_run_name = f"il{args.intrinsics_loss_weight}_rw{args.reg_weight}_lr{args.learning_rate}_bs{args.batch_size}_wd{args.weight_decay}_as{args.affine_scale}"
+            experiment_name = os.path.basename(experiment_path)
+            args.wandb_run_name = experiment_name
             if args.enable_depth_loss:
                 args.wandb_run_name += f"_dl{args.depth_loss_weight}"
         
         config = {
+            "experiment_path": experiment_path,
             "learning_rate": args.learning_rate,
             "intrinsics_loss_weight": args.intrinsics_loss_weight,
             "reg_weight": args.reg_weight,
@@ -261,178 +297,141 @@ def main_worker(gpu, ngpus_per_node, args):
             "channel_mult": [1, 2, 4, 4, 8, 16],
             "num_blocks_list": [1, 2, 2, 4, 4, 4],
             "enable_depth_loss": args.enable_depth_loss,
-            # Add visualization config to wandb
             "viz_log_freq": getattr(args, 'viz_log_freq', 50),
             "max_viz_images": getattr(args, 'max_viz_images', 4),
-            # Add multi-dataset validation info
             "validation_datasets": getattr(args, 'validation_datasets', ['mit', 'rsr_256']),
             "training_dataset": args.dataset,
+            "enable_depth_loss": args.enable_depth_loss,
         }
+
+        if args.enable_depth_loss:
+            config["depth_loss_weight"] = args.depth_loss_weight
+            config["depth_model_name"] = args.depth_model_name
 
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=config,
-            resume="allow" if args.resume else None
+            resume="allow" if checkpoint_path else None
         )
 
-    
-    model, ema_model, optimizer = init_model(args)
+    model, ema_model, optimizer, depth_loss_fn = init_model(args)
     torch.cuda.set_device(args.gpu)
 
     optimizer = AdamW(model.parameters(),
-                lr= args.learning_rate, weight_decay = args.weight_decay)
+                lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler()
 
+    # Load checkpoint if available
     args.start_epoch = 0
-    if args.resume:
-        args.resume = '{}/last.pth.tar'.format(save_folder_path)
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            ema_model.load_state_dict(checkpoint['ema_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scaler.load_state_dict(checkpoint['scaler'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-            del checkpoint
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+    if checkpoint_path:
+        args.start_epoch = load_checkpoint_improved(
+            checkpoint_path, model, ema_model, optimizer, scaler, args
+        )
 
-    transform_train = [affine_crop_resize(size = (256, 256), scale = (0.2, 1.0)),
-    transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(
-                    mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
-                ),
-    ])]
+    # Initialize datasets and loaders (keeping your existing code)
+    transform_train = [affine_crop_resize(size=(256, 256), scale=(0.2, 1.0)),
+                       transforms.Compose([
+                           transforms.ToTensor(),
+                           transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                       ])]
 
-    # Validation transform (no augmentation)
     transform_val = [None, transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
-        transforms.Normalize(
-                    mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
-                ),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])]
 
-    # UPDATED: Dataset initialization section
+    # Dataset initialization (keeping your existing logic)
     if args.dataset == 'mit':
-        #train_dataset = MIT_Dataset(args.data_path, transform_train)
-        train_dataset = MIT_Dataset_PreLoad(args.data_path, transform_train, total_split = args.world_size, split_id = args.rank)
-        # Create validation dataset
-        val_dataset = MIT_Dataset('/home/apinyol/TFM/Data/multi_illumination_test_mip2_jpg', transform_val, eval_mode = True,)
-
+        train_dataset = MIT_Dataset_PreLoad(args.data_path, transform_train, 
+                                           total_split=args.world_size, split_id=args.rank)
+        val_dataset = MIT_Dataset('/home/apinyol/TFM/Data/multi_illumination_test_mip2_jpg', 
+                                 transform_val, eval_mode=True)
     elif args.dataset == 'iiw':
-        # Updated to use the new RelightingDataset with proper parameters
-        train_dataset = IIW2(
-            root=args.data_path,  # Path to IIW images
-            img_transform=transform_train,
-            split='train',  # Training split
-            return_two_images=True
-        )
-        # Validation dataset
-        val_dataset = IIW2(
-            root=args.data_path,
-            img_transform=transform_val,
-            split='val',  # Validation split
-            return_two_images=True
-        )
-
+        train_dataset = IIW2(root=args.data_path, img_transform=transform_train, 
+                           split='train', return_two_images=True)
+        val_dataset = IIW2(root=args.data_path, img_transform=transform_val, 
+                          split='val', return_two_images=True)
     elif args.dataset == 'rsr_256':
-        # UPDATED: Use new RSRDataset with proper training/validation split
-        # Training dataset
-        train_dataset = RSRDataset(root_dir=args.data_path, 
-                          img_transform=transform_train, 
-                          is_validation=False)  # Uses all scenes except last 2
+        train_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_train, 
+                                 is_validation=False)
+        val_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_val, 
+                                is_validation=True)
 
-        # Validation dataset
-        val_dataset = RSRDataset(root_dir=args.data_path, 
-                        img_transform=transform_val, 
-                        is_validation=True)  # Uses last 2 scenes, with cross-scene references
-
-    print('NUM of training images: {}'.format(len(train_dataset)))
-    print('NUM of validation images: {}'.format(len(val_dataset)))
+    print(f'NUM of training images: {len(train_dataset)}')
+    print(f'NUM of validation images: {len(val_dataset)}')
     
-    # UPDATED: Create multiple validation datasets for comparison
     validation_datasets = create_validation_datasets(args, transform_val)
     
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle = True, drop_last = True)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle = False, drop_last = False)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, shuffle=True, drop_last=True)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset, shuffle=False, drop_last=False)
     else:
         train_sampler = None
         val_sampler = None
     
-    train_sampler = None  # You had this line, keeping it
-    val_sampler = None    # Corresponding line for validation
+    train_sampler = None
+    val_sampler = None
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last = True, persistent_workers = True)
+        num_workers=args.workers, pin_memory=False, sampler=train_sampler, 
+        drop_last=True, persistent_workers=True)
     
-    # UPDATED: Create validation loaders for all datasets
     validation_loaders = create_validation_loaders(validation_datasets, args, val_sampler)
 
-    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-            and args.is_master):
-        if not os.path.exists(save_folder_path):
-            os.system('mkdir -p {}'.format(save_folder_path))
+    global_step =  args.start_epoch * len(train_loader)
 
-    # FIXED: Initialize global step counter
-    global_step = 0
-
-    # Training loop with validation
-    for epoch in range(args.start_epoch, args.epochs+args.start_epoch):
+    # Training loop with improved checkpointing
+    for epoch in range(args.start_epoch, args.epochs + args.start_epoch):
         if args.distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
-        # Training - FIXED: Update global step counter
-        last_training_step, global_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step)
+        # Training
+        last_training_step, global_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn)
         
-        # UPDATED: Multi-dataset validation
-        val_freq = getattr(args, 'validation_freq', 1)  # Default: validate every epoch
+        # Validation
+        val_freq = getattr(args, 'validation_freq', 1)
         if epoch % val_freq == 0 or epoch == args.start_epoch:
             print(f"Running multi-dataset validation at epoch {epoch}")
-            # FIXED: Pass and update global step counter
-            all_val_metrics, global_step = validate_multi_datasets(validation_loaders, model, epoch, args, current_step=global_step)
+            all_val_metrics, global_step = validate_multi_datasets(
+                validation_loaders, model, epoch, args, current_step=global_step)
             
-            # Log validation summary for all datasets
             if args.is_master and not args.disable_wandb and all_val_metrics:
                 print(f"Multi-dataset validation metrics at epoch {epoch}:")
                 for dataset_name, metrics in all_val_metrics.items():
                     print(f"  {dataset_name}: {metrics}")
         
-        # Checkpointing
+        # Improved checkpointing
         if args.is_master:
-            if epoch % 2 == 0 and epoch != 0:
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'state_dict': model.state_dict(),
-                    'optimizer' : optimizer.state_dict(),
-                    'ema_state_dict': ema_model.state_dict(),
-                    'scaler': scaler.state_dict(),
-                }, False, filename = '{}/last.pth.tar'.format(save_folder_path))
-            if epoch % 20 == 0 and epoch != 0:
-                save_checkpoint({
+            checkpoint_state = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
+                'optimizer': optimizer.state_dict(),
                 'ema_state_dict': ema_model.state_dict(),
                 'scaler': scaler.state_dict(),
-                },False , filename = '{}/{}.pth.tar'.format(save_folder_path, epoch))
+                'args': args,
+                'global_step': global_step,
+            }
+            
+            # Save checkpoint based on save_every parameter
+            if epoch % args.save_every == 0 or epoch == args.epochs + args.start_epoch - 1:
+                print(f"Saving checkpoint at epoch {epoch + 1} to {experiment_path}")
+                save_checkpoint_improved(
+                    checkpoint_state, 
+                    experiment_path, 
+                    epoch + 1, 
+                    is_best=False,  # You can add logic to determine if it's the best
+                    keep_last=args.keep_last
+                )
 
     # Finish wandb run
     if args.is_master and not args.disable_wandb:
         wandb.finish()
-
+        
 
 def print_gradients(model):
     max_grad = 0
@@ -443,11 +442,12 @@ def print_gradients(model):
             max_norm = max(max_norm, p.data.norm(2))
     return max_grad, max_norm
 
-def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step):
+def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn=None):
     """FIXED: Modified to accept and return global_step"""
+    # FIXED: Added depth_loss to the loss_name list
     loss_name = [
-                'loss','logdet', 'light_logdet', 'intrinsic_sim',
-                'GPU Mem', 'Time', 'pe', 'ge']
+        'loss', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss',
+        'GPU Mem', 'Time', 'pe', 'ge']
     moco_loss_meter = [AverageMeter(name, ':6.3f') for name in loss_name]
     progress = ProgressMeter(
         len(train_loader),
@@ -497,12 +497,33 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
         ssim_component = 0.1 * (1 - ssim_loss(recon_img,input_img))
         grad_component = gradient_loss(recon_img,input_img)
 
+        # Compute depth consistency loss
+        depth_loss_value = torch.tensor(0.0, device=input_img.device)  # FIXED: Initialize as tensor
+        depth_input_norm = None
+        depth_recon_norm = None
+        
+        if args.enable_depth_loss and depth_loss_fn is not None:
+            # Only compute depth loss every few iterations to save computation
+            if i % 5 == 0:  # Compute every 5 iterations
+                try:
+                    depth_loss_value, depth_input_norm, depth_recon_norm = depth_loss_fn(input_img, recon_img)
+                    # FIXED: Ensure depth_loss_value is a tensor
+                    if not isinstance(depth_loss_value, torch.Tensor):
+                        depth_loss_value = torch.tensor(depth_loss_value, device=input_img.device)
+                except Exception as e:
+                    print(f"Warning: Depth loss computation failed: {e}")
+                    depth_loss_value = torch.tensor(0.0, device=input_img.device)
+
         rec_loss_total = 10 * rec_loss + ssim_component + grad_component
         logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
         logdet_ext_reg_loss = args.reg_weight * ((logdet_pred_ext - logdet_target_ext) ** 2).mean()
         intrinsic_loss_component = - args.intrinsics_loss_weight * sim_intrinsic
+        
+        # FIXED: Ensure depth_loss_weight exists and handle tensor conversion
+        depth_loss_weight = getattr(args, 'depth_loss_weight', 0.0)
+        depth_loss_component = depth_loss_weight * depth_loss_value
 
-        loss = rec_loss_total + logdet_reg_loss + logdet_ext_reg_loss + intrinsic_loss_component
+        loss = rec_loss_total + logdet_reg_loss + logdet_ext_reg_loss + intrinsic_loss_component + depth_loss_component
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -526,6 +547,8 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
             'logdet_ext_reg_loss': logdet_ext_reg_loss.item(),
             'intrinsic_similarity': sim_intrinsic.item(),
             'intrinsic_loss_component': intrinsic_loss_component.item(),
+            'depth_loss': depth_loss_value.item() if isinstance(depth_loss_value, torch.Tensor) else depth_loss_value,
+            'depth_loss_component': depth_loss_component.item() if isinstance(depth_loss_component, torch.Tensor) else depth_loss_component,
             'sigma_noise': sigma.mean().item(),
             'learning_rate': optimizer.param_groups[0]['lr'],
             'gradient_norm': ge.item() if isinstance(ge, torch.Tensor) else ge,
@@ -553,10 +576,29 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
                     mode='train',
                     max_images=getattr(args, 'max_viz_images', 4)  # Configurable number of images to show
                 )
+
+            """# Log depth maps occasionally for visualization
+            if args.enable_depth_loss and depth_input_norm is not None and i % 50 == 0:
+                depth_vis = {
+                    "depth_input": wandb.Image(depth_input_norm[0, 0].cpu().numpy(), caption="Input Depth"),
+                    "depth_recon": wandb.Image(depth_recon_norm[0, 0].cpu().numpy(), caption="Reconstructed Depth"),
+                }
+                wandb.log(depth_vis, step=current_step)"""
             
-        for val_id, val in enumerate([rec_loss, logdet_pred[:-1].mean(), logdet_pred[-1], sim_intrinsic,
-                        torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), t1 - t0, pe, ge
-                    ]):
+        # FIXED: Update the moco_loss_meter with the correct number of values matching loss_name
+        loss_values = [
+            rec_loss, 
+            logdet_pred[:-1].mean(), 
+            logdet_pred[-1], 
+            sim_intrinsic, 
+            depth_loss_value,  # Now included in loss_name
+            torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), 
+            t1 - t0, 
+            pe, 
+            ge
+        ]
+        
+        for val_id, val in enumerate(loss_values):
             if not isinstance(val, float) and not isinstance(val, int):
                 val = val.item()
             moco_loss_meter[val_id].update(val)
@@ -575,34 +617,33 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
     return current_step, final_step
 
 
-def validate_D(val_loader, model, epoch, args, current_step=None, dataset_name='validation'):
-    """Validation function with visualizations - UPDATED for 3-image validation
-    FIXED: Modified to accept current_step, dataset_name and return next_step"""
+def validate_D(val_loader, model, epoch, args, current_step=None, dataset_name='validation', depth_loss_fn=None):
+    """Validation function with simplified depth visualizations"""
     from visu_utils import log_relighting_results
     
     model.eval()
     val_metrics = {}
     
-    # FIXED: Use provided current_step directly
     if current_step is None:
         current_step = 0
 
     with torch.no_grad():
         print(f"Starting validation on {dataset_name}...")
         print(f"Len Validation loader {len(val_loader)}")
+        
         for i, batch in enumerate(val_loader):
             print(f"Validation batch {i}/{len(val_loader)} for {dataset_name}")
             val_step = current_step + i
-            if i >= getattr(args, 'max_val_batches', 2):  # Limit validation batches for speed
+            
+            if i >= getattr(args, 'max_val_batches', 2):
                 break
             
-            # UPDATED: Handle 3-image validation batch (input, ref, gt)
+            # Handle 3-image validation batch (input, ref, gt)
             if len(batch) == 3:
                 input_img, ref_img, gt_img = batch
             else:
-                # Fallback for 2-image case (shouldn't happen with validation dataset)
                 input_img, ref_img = batch
-                gt_img = ref_img  # Use ref as gt fallback
+                gt_img = ref_img
                 
             input_img = input_img.to(args.gpu)
             ref_img = ref_img.to(args.gpu)
@@ -612,55 +653,97 @@ def validate_D(val_loader, model, epoch, args, current_step=None, dataset_name='
             intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
             intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
             
-            # UPDATED: Proper relighting for validation - use input intrinsics with ref extrinsics
+            # Proper relighting for validation
             relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
+
+            # Bias correction
+            shift = (relit_img.clamp(-1,1) - gt_img).mean(dim=[2, 3], keepdim=True)
+            correct_relit_img = relit_img.clamp(-1,1) - shift
             
-            # UPDATED: Compute validation metrics against ground truth
+            # Compute validation metrics against ground truth
             val_reconstruction_loss = nn.MSELoss()(relit_img, gt_img)
-            val_input_reconstruction = nn.MSELoss()(relit_img, input_img)  # For comparison
             
-            if i == 0:  # Log metrics from first batch
+            if i == 0:
                 val_metrics = {
                     'val_reconstruction_loss_vs_gt': val_reconstruction_loss.item(),
-                    'val_reconstruction_loss_vs_input': val_input_reconstruction.item(),
                     'val_epoch': epoch,
                 }
             
-            # UPDATED: Log validation visualizations with dataset-specific prefix
-            if args.is_master and not args.disable_wandb and i in [0, 1]:  # Only first and second batch 
+            # Log visualizations for first batch only
+            if args.is_master and not args.disable_wandb and i == 0:
+                # Standard relighting visualization
                 log_relighting_results(
                     input_img=input_img,
                     ref_img=ref_img,
                     relit_img=relit_img,
                     gt_img=gt_img,
                     step=val_step,
-                    mode=f'{dataset_name}_validation'  # Dataset-specific mode
+                    mode=f'{dataset_name}_validation'
                 )
+
+                # Depth visualization if enabled
+                if args.enable_depth_loss and depth_loss_fn is not None:
+                    try:
+                        # Get depth maps
+                        depth_loss_value, input_depth, relit_depth = depth_loss_fn(input_img, correct_relit_img)
+                        
+                        # Create simple visualization
+                        depth_vis = depth_loss_fn.create_simple_visualization(
+                            input_img, correct_relit_img, input_depth, relit_depth, 
+                            epoch, dataset_name
+                        )
+                        
+                        if depth_vis is not None:
+                            wandb.log({
+                                f'{dataset_name}_depth_comparison': wandb.Image(
+                                    depth_vis, 
+                                    caption=f"Depth Comparison - {dataset_name} Epoch {epoch}"
+                                )
+                            }, step=val_step)
+                        
+                        # Add depth loss to metrics
+                        val_metrics[f'val_depth_loss'] = depth_loss_value.item()
+                        
+                    except Exception as e:
+                        print(f"Warning: Depth analysis failed for {dataset_name}: {e}")
                 
+                # Log all metrics
                 if val_metrics:
                     wandb.log(val_metrics, step=val_step)
     
     model.train()
     
-    # FIXED: Return metrics and next step
     next_step = current_step + min(len(val_loader), getattr(args, 'max_val_batches', 2))
     return val_metrics, next_step
 
 
 def validate_multi_datasets(validation_loaders, model, epoch, args, current_step=None):
-    """FIXED: Multi-dataset validation with proper step tracking and separate image logging"""
+    """Multi-dataset validation with proper step tracking"""
     all_val_metrics = {}
     
     if current_step is None:
         current_step = 0
     
+    # Initialize depth loss function if needed
+    depth_loss_fn = None
+    if args.enable_depth_loss:
+        try:
+            depth_loss_fn = DepthConsistencyLoss(
+                model_name=getattr(args, 'depth_model_name', "depth-anything/Depth-Anything-V2-Small-hf"),
+                device=args.gpu
+            )
+        except Exception as e:
+            print(f"Warning: Could not initialize depth loss function: {e}")
+    
     for dataset_name, val_loader in validation_loaders.items():
         print(f"Validating on {dataset_name} dataset...")
         
-        # FIXED: Pass current_step and dataset_name for separate image logging
-        val_metrics, current_step = validate_D(val_loader, model, epoch, args, 
-                                             current_step=current_step, 
-                                             dataset_name=dataset_name)
+        val_metrics, current_step = validate_D(
+            val_loader, model, epoch, args, 
+            current_step=current_step, 
+            dataset_name=dataset_name,
+            depth_loss_fn=depth_loss_fn
+        )
         
         # Add dataset prefix to metrics
         prefixed_metrics = {f"{dataset_name}_{k}": v for k, v in val_metrics.items()}
@@ -668,7 +751,7 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
         
         # Log dataset-specific metrics
         if args.is_master and not args.disable_wandb:
-            wandb.log(prefixed_metrics, step=current_step-1)  # Use the last step from this dataset
+            wandb.log(prefixed_metrics, step=current_step-1)
     
     return all_val_metrics, current_step
 
