@@ -33,18 +33,20 @@ python -m torch.distributed.launch \
 --reg_weight 1e-4 \
 --intrinsics_loss_weight 1e-1 \
 --epochs 50 \
---batch_size 16 \
+--batch_size 2 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
 --wandb_project "Latent_Intrinsics_Relighting" \
---wandb_run_name "rsr finetuning + depth loss" \
+--wandb_run_name "AMB logdet_ext SENSE depth loss recon totes" \
 --dataset rsr_256 \
---experiment_name "rsr_f_dl" \
---enable_depth_loss \
---depth_loss_weight 10.0 \
+--experiment_name "ft_rsr_nle_ndl_recon4" \
 --resume_from /home/apinyol/TFM/Models/Latent_Intrinsics/last.pth.tar \
 
-#--resume_from /home/apinyol/TFM/Models/Latent_Intrinsics/last.pth.tar \
+#--enable_normal_loss \
+#--normal_loss_weight 10.0 \
+
+#--enable_depth_loss \
+#--depth_loss_weight 10.0 \
 
 # Start new experiment
 #--experiment_name "depth_ablation" --learning_rate 0.001

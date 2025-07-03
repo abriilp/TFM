@@ -62,6 +62,9 @@ from eval_utils import get_eval_relight_dataloder
 # - dataset imports
 from dataset_utils import *
 
+# model visualization
+import torchvision.models as models
+from torchviz import make_dot
 
 #from sklearn.metrics import average_precision_score
 warnings.filterwarnings("ignore")
@@ -177,6 +180,7 @@ def init_model(args):
     model = UNet(img_resolution = 256, in_channels = 3, out_channels = 3,
                      num_blocks_list = [1, 2, 2, 4, 4, 4], attn_resolutions = [0], model_channels = 32,
                      channel_mult = [1, 2, 4, 4, 8, 16], affine_scale = float(args.affine_scale))
+    print("Model architecture:", model)
     model.cuda(args.gpu)
     ema_model = copy.deepcopy(model)
     ema_model.cuda(args.gpu)
@@ -461,6 +465,7 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
     sigma_data = 0.5
 
     logdet_loss = compute_logdet_loss()
+    logdet_loss_ext = compute_logdet_loss()
     ssim_loss = compute_SSIM_loss()
 
     # Import visualization utilities
@@ -484,18 +489,38 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
             intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder = True)
             intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder = True)
 
-            mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
-            intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]
+            """mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
+            intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]"""
 
-            recon_img = model([intrinsic, extrinsic_ref], run_encoder = False).float()
+            recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder = False).float()
+            recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder = False).float()
+            recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder = False).float()
+            recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder = False).float()
+
 
         
         logdet_pred, logdet_target = logdet_loss(intrinsic_input)
+       
         logdet_pred_ext, logdet_target_ext = logdet_loss([extrinsic_input])
+
+
         sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
-        rec_loss = nn.MSELoss()(recon_img,input_img)
-        ssim_component = 0.1 * (1 - ssim_loss(recon_img,input_img))
-        grad_component = gradient_loss(recon_img,input_img)
+
+        rec_loss_rr = nn.MSELoss()(recon_img_rr, ref_img)
+        ssim_component_rr = 0.1 * (1 - ssim_loss(recon_img_rr, ref_img))
+        grad_component_rr = gradient_loss(recon_img_rr, ref_img)
+
+        rec_loss_ri = nn.MSELoss()(recon_img_ri, input_img)
+        ssim_component_ri = 0.1 * (1 - ssim_loss(recon_img_ri, input_img))
+        grad_component_ri = gradient_loss(recon_img_ri ,input_img)
+
+        rec_loss_ir = nn.MSELoss()(recon_img_ir,ref_img)
+        ssim_component_ir = 0.1 * (1 - ssim_loss(recon_img_ir,ref_img))
+        grad_component_ir= gradient_loss(recon_img_ir,ref_img)
+
+        rec_loss_ii = nn.MSELoss()(recon_img_ii,input_img)
+        ssim_component_ii = 0.1 * (1 - ssim_loss(recon_img_ii,input_img))
+        grad_component_ii = gradient_loss(recon_img_ii,input_img)
 
         # Compute depth consistency loss
         depth_loss_value = torch.tensor(0.0, device=input_img.device)  # FIXED: Initialize as tensor
@@ -506,7 +531,7 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
             # Only compute depth loss every few iterations to save computation
             if i % 5 == 0:  # Compute every 5 iterations
                 try:
-                    depth_loss_value, depth_input_norm, depth_recon_norm = depth_loss_fn(input_img, recon_img)
+                    depth_loss_value, depth_input_norm, depth_recon_norm = depth_loss_fn(input_img, recon_img_ri)
                     # FIXED: Ensure depth_loss_value is a tensor
                     if not isinstance(depth_loss_value, torch.Tensor):
                         depth_loss_value = torch.tensor(depth_loss_value, device=input_img.device)
@@ -514,16 +539,21 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
                     print(f"Warning: Depth loss computation failed: {e}")
                     depth_loss_value = torch.tensor(0.0, device=input_img.device)
 
-        rec_loss_total = 10 * rec_loss + ssim_component + grad_component
+        rec_loss_total_rr = 10 * rec_loss_rr + ssim_component_rr + grad_component_rr
+        rec_loss_total_ri = 10 * rec_loss_ri + ssim_component_ri + grad_component_ri
+        rec_loss_total_ir = 10 * rec_loss_ir + ssim_component_ir + grad_component_ir
+        rec_loss_total_ii = 10 * rec_loss_ii + ssim_component_ii + grad_component_ii
+        rec_loss_total = (rec_loss_total_rr + rec_loss_total_ri + rec_loss_total_ir + rec_loss_total_ii) / 4.0
+
         logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
         logdet_ext_reg_loss = args.reg_weight * ((logdet_pred_ext - logdet_target_ext) ** 2).mean()
-        intrinsic_loss_component = - args.intrinsics_loss_weight * sim_intrinsic
+        intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
         
         # FIXED: Ensure depth_loss_weight exists and handle tensor conversion
         depth_loss_weight = getattr(args, 'depth_loss_weight', 0.0)
         depth_loss_component = depth_loss_weight * depth_loss_value
 
-        loss = rec_loss_total + logdet_reg_loss + logdet_ext_reg_loss + intrinsic_loss_component + depth_loss_component
+        loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + depth_loss_component + logdet_ext_reg_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -537,19 +567,12 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
         # Collect metrics including depth loss
         metrics = {
             'total_loss': loss.item(),
-            'reconstruction_loss': rec_loss.item(),
-            'rec_loss_mse': rec_loss.item(),
-            'rec_loss_ssim': ssim_component.item() if isinstance(ssim_component, torch.Tensor) else ssim_component,
-            'rec_loss_gradient': grad_component.item() if isinstance(grad_component, torch.Tensor) else grad_component,
-            'logdet_loss': logdet_pred[:-1].mean().item(),
-            'light_logdet_loss': logdet_pred[-1].item(),
-            'logdet_reg_loss': logdet_reg_loss.item(),
-            'logdet_ext_reg_loss': logdet_ext_reg_loss.item(),
+            'rec_loss_total1': rec_loss_total.item(),
+            'logdet_reg_loss2': logdet_reg_loss.item(),
+            'logdet_ext_reg_loss3': logdet_ext_reg_loss.item(),
+            'intrinsic_loss_component4': intrinsic_loss_component.item(),
+            'depth_loss_component5': depth_loss_component.item() if isinstance(depth_loss_component, torch.Tensor) else depth_loss_component,
             'intrinsic_similarity': sim_intrinsic.item(),
-            'intrinsic_loss_component': intrinsic_loss_component.item(),
-            'depth_loss': depth_loss_value.item() if isinstance(depth_loss_value, torch.Tensor) else depth_loss_value,
-            'depth_loss_component': depth_loss_component.item() if isinstance(depth_loss_component, torch.Tensor) else depth_loss_component,
-            'sigma_noise': sigma.mean().item(),
             'learning_rate': optimizer.param_groups[0]['lr'],
             'gradient_norm': ge.item() if isinstance(ge, torch.Tensor) else ge,
             'parameter_norm': pe.item() if isinstance(pe, torch.Tensor) else pe,
@@ -565,17 +588,17 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
             
             # Log visualizations less frequently to avoid overwhelming wandb
             viz_freq = getattr(args, 'viz_log_freq', args.log_freq * 10)  # Default: 10x less frequent than metrics
-            if i % viz_freq == 0 or i == 0:
+            """if i % viz_freq == 0 or i == 0:
                 log_training_visualizations(
                     input_img=input_img,
                     ref_img=ref_img,
-                    recon_img=recon_img,
+                    recon_img=recon_img_ri,
                     noisy_input_img=noisy_input_img,
                     noisy_ref_img=noisy_ref_img,
                     step=current_step,
                     mode='train',
                     max_images=getattr(args, 'max_viz_images', 4)  # Configurable number of images to show
-                )
+                )"""
 
             """# Log depth maps occasionally for visualization
             if args.enable_depth_loss and depth_input_norm is not None and i % 50 == 0:
@@ -587,7 +610,7 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
             
         # FIXED: Update the moco_loss_meter with the correct number of values matching loss_name
         loss_values = [
-            rec_loss, 
+            rec_loss_total.item(), 
             logdet_pred[:-1].mean(), 
             logdet_pred[-1], 
             sim_intrinsic, 

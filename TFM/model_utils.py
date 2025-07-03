@@ -12,39 +12,46 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
         shutil.copyfile(filename, 'model_best.pth.tar')
 
 def compute_logdet(W, eps = 0.2):
-    m, p = W.shape  # [d, B]
+    m, p = W.shape  # [d, B] 
     W = W.float()
     I = torch.eye(p, device=W.device)
     scalar = p / (m * eps)
     cov = W.T.matmul(W)
-    cov = torch.stack(FullGatherLayer.apply(cov)).mean(dim = 0)
+    cov = torch.stack(FullGatherLayer.apply(cov))
+    cov = cov.mean(dim = 0)
     logdet = torch.logdet(I + scalar * cov)
     return logdet / 2.
 
 def intrinsic_loss(intrinsic1_list, intrinsic2_list):
     sim_intrinsic_list = []
     for intrinsic1, intrinsic2 in zip(intrinsic1_list, intrinsic2_list):
-        sim_intrinsic_list.append((intrinsic1 * intrinsic2).sum(dim = 1).mean())
+        sim_intrinsic_list.append(((intrinsic1 - intrinsic2)**2).sum(dim = 1).mean())
+        #print(f"intrinsic1 shape: {intrinsic1.sum(dim=1).shape}, intrinsic2 shape: {intrinsic2.shape})")
     return torch.stack(sim_intrinsic_list).mean()
 
 class compute_logdet_loss():
     def __init__(self):
         self.target_val_list = None
 
-    def __call__(self, data_list):
+    def __call__(self, data_list, prints=False):
         logdet_list = []
         target_val_list  = []
         with torch.cuda.amp.autocast(enabled = False):
             for idx, data in enumerate(data_list):
                 if len(data.shape) == 4:
+                    #print(f"data shape: {data.shape}")
                     data = data.permute(0,2,3,1).reshape(-1, data.shape[1])
                 logdet = compute_logdet(data)
                 logdet_list.append(logdet)
+                if prints:
+                        print(f"Logdet {idx}: {logdet_list[idx].item()}")
                 if self.target_val_list is None:
                     logdet_target = compute_logdet(F.normalize(torch.randn_like(data), dim = -1)).detach().data
                     target_val_list.append(logdet_target)
-            if self.target_val_list is None:
-                self.target_val_list = target_val_list
+                if self.target_val_list is None:
+                    if prints:
+                        print(f"Logdet target {idx}:  {target_val_list}")
+                    self.target_val_list = target_val_list
             return torch.stack(logdet_list), torch.stack(self.target_val_list)
 
 @torch.no_grad()
