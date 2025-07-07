@@ -177,20 +177,19 @@ args = parser.parse_args()
 
 
 def init_model(args):
-    model = UNet(img_resolution = 256, in_channels = 3, out_channels = 3,
-                     num_blocks_list = [1, 2, 2, 4, 4, 4], attn_resolutions = [0], model_channels = 32,
-                     channel_mult = [1, 2, 4, 4, 8, 16], affine_scale = float(args.affine_scale))
+    model = UNet(img_resolution=256, in_channels=3, out_channels=3,
+                 num_blocks_list=[1, 2, 2, 4, 4, 4], attn_resolutions=[0], model_channels=32,
+                 channel_mult=[1, 2, 4, 4, 8, 16], affine_scale=float(args.affine_scale))
     print("Model architecture:", model)
     model.cuda(args.gpu)
     ema_model = copy.deepcopy(model)
     ema_model.cuda(args.gpu)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True,
-    broadcast_buffers=False)
-    ema_model = torch.nn.parallel.DistributedDataParallel(ema_model, device_ids=[args.gpu], find_unused_parameters=True,
-    broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], 
+                                                      find_unused_parameters=True, broadcast_buffers=False)
+    ema_model = torch.nn.parallel.DistributedDataParallel(ema_model, device_ids=[args.gpu], 
+                                                          find_unused_parameters=True, broadcast_buffers=False)
     init_ema_model(model, ema_model)
-    optimizer = AdamW(model.parameters(),
-                lr= args.learning_rate, weight_decay = args.weight_decay)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     depth_loss_fn = None
     if args.enable_depth_loss:
@@ -201,17 +200,18 @@ def init_model(args):
 
     return model, ema_model, optimizer, depth_loss_fn
 
+
 def main():
     torch.manual_seed(2)
     import os
-    #torch.backends.cudnn.benchmark=False
     cudnn.deterministic = True
     args = parser.parse_args()
-    #assert args.batch_size % args.batch_iter == 0
-    if not os.path.exists('visualize'):
-        os.system('mkdir visualize')
-    if not os.path.exists('checkpoint'):
-        os.system('mkdir checkpoint')
+    
+    # Create necessary directories
+    os.makedirs('visualize', exist_ok=True)
+    os.makedirs('checkpoint', exist_ok=True)
+    
+    # Set random seeds if specified
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -219,34 +219,34 @@ def main():
         cudnn.deterministic = True
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
-                      'which can slow down your training considerably! '
-                      'You may see unexpected behavior when restarting '
-                      'from checkpoints.')
+                      'which can slow down your training considerably!')
 
     if args.gpu is not None:
-        warnings.warn('You have chosen a specific GPU. This will completely '
-                      'disable data parallelism.')
+        warnings.warn('You have chosen a specific GPU. This will completely disable data parallelism.')
 
+    # Setup distributed training
     if "WORLD_SIZE" in os.environ:
         args.world_size = int(os.environ["WORLD_SIZE"])
     args.distributed = args.world_size >= 1
     ngpus_per_node = torch.cuda.device_count()
 
-    print('start')
+    print('Starting training...')
     if args.distributed:
-        if args.local_rank != -1: # for torch.distributed.launch
+        if args.local_rank != -1:  # torch.distributed.launch
             args.rank = args.local_rank
             args.gpu = args.local_rank
-        elif 'SLURM_PROCID' in os.environ: # for slurm scheduler
+        elif 'SLURM_PROCID' in os.environ:  # SLURM scheduler
             args.rank = int(os.environ['SLURM_PROCID'])
             args.gpu = args.rank % torch.cuda.device_count()
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+    
     args.gpu = args.gpu % torch.cuda.device_count()
-    print('world_size', args.world_size)
-    print('rank', args.rank)
-    # suppress printing if not on master gpu
-    if args.rank!=0:
+    print('World size:', args.world_size)
+    print('Rank:', args.rank)
+    
+    # Suppress printing if not master GPU
+    if args.rank != 0:
         def print_pass(*args):
             pass
         builtins.print = print_pass
@@ -254,23 +254,30 @@ def main():
     args.distributed = args.world_size >= 1 or args.multiprocessing_distributed
     main_worker(args.gpu, ngpus_per_node, args)
 
+
 def main_worker(gpu, ngpus_per_node, args):
     args = copy.deepcopy(args)
     args.cos = True
     args.is_master = args.rank == 0
 
-    # Create or find experiment folder
+    # Handle resuming/finetuning
+    is_finetuning = False
+    checkpoint_path = None
+    loaded_epoch = 0
+    
     if args.resume or args.auto_resume or args.resume_from:
         experiment_path, checkpoint_path = find_experiment_folder(args)
         if experiment_path is None:
             if args.is_master:
                 print("No checkpoint found for resuming, starting new experiment")
                 experiment_path = create_experiment_folder(args)
-                checkpoint_path = None
+        else:
+            is_finetuning = True
+            if args.is_master:
+                print(f"Found checkpoint for finetuning: {checkpoint_path}")
     else:
         if args.is_master:
             experiment_path = create_experiment_folder(args)
-            checkpoint_path = None
 
     args.save_folder_path = experiment_path
     
@@ -285,6 +292,10 @@ def main_worker(gpu, ngpus_per_node, args):
             args.wandb_run_name = experiment_name
             if args.enable_depth_loss:
                 args.wandb_run_name += f"_dl{args.depth_loss_weight}"
+        
+        # Add finetuning indicator to run name
+        if is_finetuning:
+            args.wandb_run_name += "_finetuned"
         
         config = {
             "experiment_path": experiment_path,
@@ -305,7 +316,7 @@ def main_worker(gpu, ngpus_per_node, args):
             "max_viz_images": getattr(args, 'max_viz_images', 4),
             "validation_datasets": getattr(args, 'validation_datasets', ['mit', 'rsr_256']),
             "training_dataset": args.dataset,
-            "enable_depth_loss": args.enable_depth_loss,
+            "is_finetuning": is_finetuning,
         }
 
         if args.enable_depth_loss:
@@ -319,34 +330,88 @@ def main_worker(gpu, ngpus_per_node, args):
             resume="allow" if checkpoint_path else None
         )
 
+    # Initialize model and optimizer
     model, ema_model, optimizer, depth_loss_fn = init_model(args)
     torch.cuda.set_device(args.gpu)
-
-    optimizer = AdamW(model.parameters(),
-                lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler()
 
-    # Load checkpoint if available
-    args.start_epoch = 0
+    # Load checkpoint if available (but reset counters)
     if checkpoint_path:
-        args.start_epoch = load_checkpoint_improved(
+        loaded_epoch = load_checkpoint_improved(
             checkpoint_path, model, ema_model, optimizer, scaler, args
         )
+        if args.is_master:
+            print(f"Loaded checkpoint from epoch {loaded_epoch}, but starting fresh at epoch 0")
+            if is_finetuning:
+                print("Starting from epoch 0 with loaded weights (finetuning)")
 
-    # Initialize datasets and loaders (keeping your existing code)
-    transform_train = [affine_crop_resize(size=(256, 256), scale=(0.2, 1.0)),
-                       transforms.Compose([
-                           transforms.ToTensor(),
-                           transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                       ])]
+    # Initialize datasets and loaders
+    train_dataset, val_dataset = setup_datasets(args)
+    print(f'Training images: {len(train_dataset)}')
+    print(f'Validation images: {len(val_dataset)}')
+    
+    # Create data loaders
+    train_loader, validation_loaders = setup_data_loaders(train_dataset, val_dataset, args)
+    
+    # Training loop - always start from 0
+    global_step = 0
+    for epoch in range(args.epochs):
+        if args.distributed and hasattr(train_loader, 'sampler') and train_loader.sampler is not None:
+            train_loader.sampler.set_epoch(epoch)
+        
+        # Training
+        global_step = train_epoch(train_loader, model, scaler, optimizer, ema_model, 
+                                  epoch, args, global_step, depth_loss_fn, is_finetuning)
+        
+        # Validation every 5 epochs
+        if epoch % 3 == 0 or epoch == 0:
+            print(f"Running validation at epoch {epoch}")
+            validate_multi_datasets(validation_loaders, model, epoch, args, global_step)
+        
+        # Save checkpoint
+        if args.is_master and (epoch % args.save_every == 0 or epoch == args.epochs - 1):
+            save_checkpoint_improved(
+                {
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'ema_state_dict': ema_model.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'args': args,
+                    'global_step': global_step,
+                    'original_loaded_epoch': loaded_epoch,  # Keep track of original epoch
+                },
+                experiment_path, 
+                epoch + 1, 
+                is_best=False,
+                keep_last=args.keep_last
+            )
 
-    transform_val = [None, transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])]
+    # Finish wandb
+    if args.is_master and not args.disable_wandb:
+        wandb.finish()
 
-    # Dataset initialization (keeping your existing logic)
+
+def setup_datasets(args):
+    """Setup training and validation datasets"""
+    transform_train = [
+        affine_crop_resize(size=(256, 256), scale=(0.2, 1.0)),
+        transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    ]
+
+    transform_val = [
+        None, 
+        transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    ]
+
+    # Dataset initialization
     if args.dataset == 'mit':
         train_dataset = MIT_Dataset_PreLoad(args.data_path, transform_train, 
                                            total_split=args.world_size, split_id=args.rank)
@@ -362,12 +427,15 @@ def main_worker(gpu, ngpus_per_node, args):
                                  is_validation=False)
         val_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_val, 
                                 is_validation=True)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    print(f'NUM of training images: {len(train_dataset)}')
-    print(f'NUM of validation images: {len(val_dataset)}')
-    
-    validation_datasets = create_validation_datasets(args, transform_val)
-    
+    return train_dataset, val_dataset
+
+
+def setup_data_loaders(train_dataset, val_dataset, args):
+    """Setup data loaders for training and validation"""
+    # Setup samplers
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             train_dataset, shuffle=True, drop_last=True)
@@ -377,106 +445,54 @@ def main_worker(gpu, ngpus_per_node, args):
         train_sampler = None
         val_sampler = None
     
-    train_sampler = None
-    val_sampler = None
-    
+    # Create train loader
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=False, sampler=train_sampler, 
-        drop_last=True, persistent_workers=True)
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=(train_sampler is None),
+        num_workers=args.workers, 
+        pin_memory=False, 
+        sampler=train_sampler, 
+        drop_last=True, 
+        persistent_workers=True
+    )
     
+    # Create validation loaders
+    validation_datasets = create_validation_datasets(args, 
+                                                   [None, transforms.Compose([
+                                                       transforms.Resize((256, 256)),
+                                                       transforms.ToTensor(),
+                                                       transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                                                   ])])
     validation_loaders = create_validation_loaders(validation_datasets, args, val_sampler)
+    
+    return train_loader, validation_loaders
 
-    global_step =  args.start_epoch * len(train_loader)
 
-    # Training loop with improved checkpointing
-    for epoch in range(args.start_epoch, args.epochs + args.start_epoch):
-        if args.distributed and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        
-        # Training
-        last_training_step, global_step = train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn)
-        
-        # Validation
-        val_freq = getattr(args, 'validation_freq', 1)
-        if epoch % val_freq == 0 or epoch == args.start_epoch:
-            print(f"Running multi-dataset validation at epoch {epoch}")
-            all_val_metrics, global_step = validate_multi_datasets(
-                validation_loaders, model, epoch, args, current_step=global_step)
-            
-            if args.is_master and not args.disable_wandb and all_val_metrics:
-                print(f"Multi-dataset validation metrics at epoch {epoch}:")
-                for dataset_name, metrics in all_val_metrics.items():
-                    print(f"  {dataset_name}: {metrics}")
-        
-        # Improved checkpointing
-        if args.is_master:
-            checkpoint_state = {
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'ema_state_dict': ema_model.state_dict(),
-                'scaler': scaler.state_dict(),
-                'args': args,
-                'global_step': global_step,
-            }
-            
-            # Save checkpoint based on save_every parameter
-            if epoch % args.save_every == 0 or epoch == args.epochs + args.start_epoch - 1:
-                print(f"Saving checkpoint at epoch {epoch + 1} to {experiment_path}")
-                save_checkpoint_improved(
-                    checkpoint_state, 
-                    experiment_path, 
-                    epoch + 1, 
-                    is_best=False,  # You can add logic to determine if it's the best
-                    keep_last=args.keep_last
-                )
+def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn, is_finetuning):
+    """Train for one epoch"""
+    loss_metrics = ['loss', 'reconstruction', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss']
+    meters = [AverageMeter(name, ':6.3f') for name in loss_metrics]
+    progress = ProgressMeter(len(train_loader), meters, prefix=f"Epoch: [{epoch}]")
 
-    # Finish wandb run
-    if args.is_master and not args.disable_wandb:
-        wandb.finish()
-        
-
-def print_gradients(model):
-    max_grad = 0
-    max_norm = 0
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            max_grad = max(max_grad, p.grad.norm())
-            max_norm = max(max_norm, p.data.norm(2))
-    return max_grad, max_norm
-
-def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn=None):
-    """FIXED: Modified to accept and return global_step"""
-    # FIXED: Added depth_loss to the loss_name list
-    loss_name = [
-        'loss', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss',
-        'GPU Mem', 'Time', 'pe', 'ge']
-    moco_loss_meter = [AverageMeter(name, ':6.3f') for name in loss_name]
-    progress = ProgressMeter(
-        len(train_loader),
-        moco_loss_meter,
-        prefix="Epoch: [{}]".format(epoch))
-
-    # switch to train mode
-    t0 = time.time()
-    P_mean=-1.2
-    P_std=1.2
+    model.train()
+    
+    # Training parameters
+    P_mean, P_std = -1.2, 1.2
     sigma_data = 0.5
-
+    
+    # Loss functions
     logdet_loss = compute_logdet_loss()
     logdet_loss_ext = compute_logdet_loss()
     ssim_loss = compute_SSIM_loss()
 
-    # Import visualization utilities
-    from visu_utils import log_training_visualizations
-
     for i, (input_img, ref_img) in enumerate(train_loader):
         current_step = global_step + i
-
+        
         input_img = input_img.to(args.gpu)
         ref_img = ref_img.to(args.gpu)
 
+        # Add noise
         rnd_normal = torch.randn([input_img.shape[0], 1, 1, 1], device=input_img.device)
         sigma = (rnd_normal * P_std + P_mean).exp()
         if epoch >= 60:
@@ -485,298 +501,201 @@ def train_D(train_loader, model, scaler, optimizer, ema_model, epoch, args, glob
         noisy_input_img = input_img + torch.randn_like(input_img) * sigma
         noisy_ref_img = ref_img + torch.randn_like(ref_img) * sigma
 
+        # Forward pass
         with torch.cuda.amp.autocast():
-            intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder = True)
-            intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder = True)
+            intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder=True)
+            intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder=True)
 
-            """mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
-            intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]"""
+            # Reconstruct images
+            recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder=False).float()
+            recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
+            recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder=False).float()
+            recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
 
-            recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder = False).float()
-            recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder = False).float()
-            recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder = False).float()
-            recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder = False).float()
-
-
+        # Compute losses
+        rec_loss_total = compute_reconstruction_loss(
+            [(recon_img_rr, ref_img), (recon_img_ir, ref_img), 
+             (recon_img_ri, input_img), (recon_img_ii, input_img)], 
+            ssim_loss
+        )
         
         logdet_pred, logdet_target = logdet_loss(intrinsic_input)
-       
-        logdet_pred_ext, logdet_target_ext = logdet_loss([extrinsic_input])
-
-
-        sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
-
-        rec_loss_rr = nn.MSELoss()(recon_img_rr, ref_img)
-        ssim_component_rr = 0.1 * (1 - ssim_loss(recon_img_rr, ref_img))
-        grad_component_rr = gradient_loss(recon_img_rr, ref_img)
-
-        rec_loss_ri = nn.MSELoss()(recon_img_ri, input_img)
-        ssim_component_ri = 0.1 * (1 - ssim_loss(recon_img_ri, input_img))
-        grad_component_ri = gradient_loss(recon_img_ri ,input_img)
-
-        rec_loss_ir = nn.MSELoss()(recon_img_ir,ref_img)
-        ssim_component_ir = 0.1 * (1 - ssim_loss(recon_img_ir,ref_img))
-        grad_component_ir= gradient_loss(recon_img_ir,ref_img)
-
-        rec_loss_ii = nn.MSELoss()(recon_img_ii,input_img)
-        ssim_component_ii = 0.1 * (1 - ssim_loss(recon_img_ii,input_img))
-        grad_component_ii = gradient_loss(recon_img_ii,input_img)
-
-        # Compute depth consistency loss
-        depth_loss_value = torch.tensor(0.0, device=input_img.device)  # FIXED: Initialize as tensor
-        depth_input_norm = None
-        depth_recon_norm = None
+        logdet_pred_ext, logdet_target_ext = logdet_loss_ext([extrinsic_input])
         
-        if args.enable_depth_loss and depth_loss_fn is not None:
-            # Only compute depth loss every few iterations to save computation
-            if i % 5 == 0:  # Compute every 5 iterations
-                try:
-                    depth_loss_value, depth_input_norm, depth_recon_norm = depth_loss_fn(input_img, recon_img_ri)
-                    # FIXED: Ensure depth_loss_value is a tensor
-                    if not isinstance(depth_loss_value, torch.Tensor):
-                        depth_loss_value = torch.tensor(depth_loss_value, device=input_img.device)
-                except Exception as e:
-                    print(f"Warning: Depth loss computation failed: {e}")
-                    depth_loss_value = torch.tensor(0.0, device=input_img.device)
-
-        rec_loss_total_rr = 10 * rec_loss_rr + ssim_component_rr + grad_component_rr
-        rec_loss_total_ri = 10 * rec_loss_ri + ssim_component_ri + grad_component_ri
-        rec_loss_total_ir = 10 * rec_loss_ir + ssim_component_ir + grad_component_ir
-        rec_loss_total_ii = 10 * rec_loss_ii + ssim_component_ii + grad_component_ii
-        rec_loss_total = (rec_loss_total_rr + rec_loss_total_ri + rec_loss_total_ir + rec_loss_total_ii) / 4.0
-
         logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
         logdet_ext_reg_loss = args.reg_weight * ((logdet_pred_ext - logdet_target_ext) ** 2).mean()
+        
+        sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
         intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
         
-        # FIXED: Ensure depth_loss_weight exists and handle tensor conversion
-        depth_loss_weight = getattr(args, 'depth_loss_weight', 0.0)
-        depth_loss_component = depth_loss_weight * depth_loss_value
+        # Depth loss
+        depth_loss_value = torch.tensor(0.0, device=input_img.device)
+        if args.enable_depth_loss and depth_loss_fn is not None and i % 5 == 0:
+            try:
+                depth_loss_value, _, _ = depth_loss_fn(input_img, recon_img_ri)
+                if not isinstance(depth_loss_value, torch.Tensor):
+                    depth_loss_value = torch.tensor(depth_loss_value, device=input_img.device)
+            except Exception as e:
+                print(f"Warning: Depth loss computation failed: {e}")
+                depth_loss_value = torch.tensor(0.0, device=input_img.device)
 
-        loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + depth_loss_component + logdet_ext_reg_loss
+        depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
+        
+        # Total loss
+        total_loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + depth_loss_component + logdet_ext_reg_loss
 
-        scaler.scale(loss).backward()
+        # Backward pass
+        scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
-        ge, pe = print_gradients(model)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
         update_ema_model(model, ema_model, 0.999)
 
-        t1 = time.time()
-        # Collect metrics including depth loss
-        metrics = {
-            'total_loss': loss.item(),
-            'rec_loss_total1': rec_loss_total.item(),
-            'logdet_reg_loss2': logdet_reg_loss.item(),
-            'logdet_ext_reg_loss3': logdet_ext_reg_loss.item(),
-            'intrinsic_loss_component4': intrinsic_loss_component.item(),
-            'depth_loss_component5': depth_loss_component.item() if isinstance(depth_loss_component, torch.Tensor) else depth_loss_component,
-            'intrinsic_similarity': sim_intrinsic.item(),
-            'learning_rate': optimizer.param_groups[0]['lr'],
-            'gradient_norm': ge.item() if isinstance(ge, torch.Tensor) else ge,
-            'parameter_norm': pe.item() if isinstance(pe, torch.Tensor) else pe,
-            'gpu_memory_mb': torch.cuda.max_memory_allocated() / (1024.0 * 1024.0),
-            'step_time': t1 - t0,
-            'epoch': epoch,
-        }
+        # Log metrics
+        if args.is_master and not args.disable_wandb and i % args.log_freq == 0:
+            metrics = {
+                'total_loss': total_loss.item(),
+                'reconstruction_loss': rec_loss_total.item(),
+                'logdet_loss': logdet_reg_loss.item(),
+                'intrinsic_loss': intrinsic_loss_component.item(),
+                'logdet_ext_loss': logdet_ext_reg_loss.item(),
+                'depth_loss': depth_loss_component.item(),
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'epoch': epoch,
+                'is_finetuning': is_finetuning,
+            }
+            wandb.log(metrics, step=current_step)
 
-        # Log training visualizations (configurable frequency)
-        if args.is_master and not args.disable_wandb:
-            if i % args.log_freq == 0 or i == 0:
-                wandb.log(metrics, step=current_step)
-            
-            # Log visualizations less frequently to avoid overwhelming wandb
-            viz_freq = getattr(args, 'viz_log_freq', args.log_freq * 10)  # Default: 10x less frequent than metrics
-            """if i % viz_freq == 0 or i == 0:
-                log_training_visualizations(
-                    input_img=input_img,
-                    ref_img=ref_img,
-                    recon_img=recon_img_ri,
-                    noisy_input_img=noisy_input_img,
-                    noisy_ref_img=noisy_ref_img,
-                    step=current_step,
-                    mode='train',
-                    max_images=getattr(args, 'max_viz_images', 4)  # Configurable number of images to show
-                )"""
-
-            """# Log depth maps occasionally for visualization
-            if args.enable_depth_loss and depth_input_norm is not None and i % 50 == 0:
-                depth_vis = {
-                    "depth_input": wandb.Image(depth_input_norm[0, 0].cpu().numpy(), caption="Input Depth"),
-                    "depth_recon": wandb.Image(depth_recon_norm[0, 0].cpu().numpy(), caption="Reconstructed Depth"),
-                }
-                wandb.log(depth_vis, step=current_step)"""
-            
-        # FIXED: Update the moco_loss_meter with the correct number of values matching loss_name
-        loss_values = [
-            rec_loss_total.item(), 
-            logdet_pred[:-1].mean(), 
-            logdet_pred[-1], 
-            sim_intrinsic, 
-            depth_loss_value,  # Now included in loss_name
-            torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), 
-            t1 - t0, 
-            pe, 
-            ge
-        ]
+        # Update progress meters
+        meters[0].update(total_loss.item())
+        meters[1].update(rec_loss_total.item())
+        meters[2].update(logdet_reg_loss.item())
+        meters[3].update(logdet_ext_reg_loss.item())
+        meters[4].update(intrinsic_loss_component.item())
+        meters[5].update(depth_loss_component.item())
         
-        for val_id, val in enumerate(loss_values):
-            if not isinstance(val, float) and not isinstance(val, int):
-                val = val.item()
-            moco_loss_meter[val_id].update(val)
-        progress.display(i)
-        t0 = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if i % 50 == 0:
+            progress.display(i)
 
-    """if args.gpu == 0 and epoch % 5 == 0:
-        target_img = ref_img[torch.randperm(input_img.shape[0]).to(args.gpu)]
-        plot_relight_img_train(model, input_img, ref_img, target_img, args.save_folder_path + '/{:05d}_{:05d}_gen'.format(epoch + 1, i))
-    ARREGLAR,RuntimeError: shape '[2, 2, 3, 256, 256]' is invalid for input of size 3145728 """
     torch.distributed.barrier()
-    
-    # FIXED: Return the updated global step
-    final_step = global_step + len(train_loader)
-    return current_step, final_step
+    return global_step + len(train_loader)
 
 
-def validate_D(val_loader, model, epoch, args, current_step=None, dataset_name='validation', depth_loss_fn=None):
-    """Validation function with simplified depth visualizations"""
-    from visu_utils import log_relighting_results
-    
+def compute_reconstruction_loss(recon_pairs, ssim_loss):
+    """Compute reconstruction loss for multiple image pairs"""
+    total_loss = 0
+    for recon_img, target_img in recon_pairs:
+        mse_loss = nn.MSELoss()(recon_img, target_img)
+        ssim_component = 0.1 * (1 - ssim_loss(recon_img, target_img))
+        grad_component = gradient_loss(recon_img, target_img)
+        total_loss += 10 * mse_loss + ssim_component + grad_component
+    return total_loss / len(recon_pairs)
+
+
+def validate_multi_datasets(validation_loaders, model, epoch, args, current_step):
+    """Validation using the same losses as training"""
     model.eval()
-    val_metrics = {}
     
-    if current_step is None:
-        current_step = 0
-
+    # Loss functions
+    logdet_loss = compute_logdet_loss()
+    logdet_loss_ext = compute_logdet_loss()
+    ssim_loss = compute_SSIM_loss()
+    
     with torch.no_grad():
-        print(f"Starting validation on {dataset_name}...")
-        print(f"Len Validation loader {len(val_loader)}")
-        
-        for i, batch in enumerate(val_loader):
-            print(f"Validation batch {i}/{len(val_loader)} for {dataset_name}")
-            val_step = current_step + i
+        for dataset_name, val_loader in validation_loaders.items():
+            print(f"Validating on {dataset_name}...")
             
-            if i >= getattr(args, 'max_val_batches', 2):
-                break
-            
-            # Handle 3-image validation batch (input, ref, gt)
-            if len(batch) == 3:
-                input_img, ref_img, gt_img = batch
-            else:
-                input_img, ref_img = batch
-                gt_img = ref_img
+            val_metrics = {}
+            total_loss = 0
+            total_rec_loss = 0
+            total_logdet_int_loss = 0
+            total_logdet_ext_loss = 0
+            total_intrinsic_loss = 0
+            num_batches = 0
+
+            total_val_batches = len(val_loader)
+            last_batch_idx = total_val_batches - 1
+
+            for i, batch in enumerate(val_loader):
+                if i != 0 and i != last_batch_idx:
+                    continue
+                    
+                if len(batch) == 3:
+                    input_img, ref_img, gt_img = batch
+                else:
+                    input_img, ref_img = batch
+                    gt_img = ref_img
                 
-            input_img = input_img.to(args.gpu)
-            ref_img = ref_img.to(args.gpu)
-            gt_img = gt_img.to(args.gpu)
-            
-            # Forward pass without noise for validation
-            intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
-            intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
-            
-            # Proper relighting for validation
-            relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
-
-            # Bias correction
-            shift = (relit_img.clamp(-1,1) - gt_img).mean(dim=[2, 3], keepdim=True)
-            correct_relit_img = relit_img.clamp(-1,1) - shift
-            
-            # Compute validation metrics against ground truth
-            val_reconstruction_loss = nn.MSELoss()(relit_img, gt_img)
-            
-            if i == 0:
-                val_metrics = {
-                    'val_reconstruction_loss_vs_gt': val_reconstruction_loss.item(),
-                    'val_epoch': epoch,
-                }
-            
-            # Log visualizations for first batch only
-            if args.is_master and not args.disable_wandb and i == 0:
-                # Standard relighting visualization
-                log_relighting_results(
-                    input_img=input_img,
-                    ref_img=ref_img,
-                    relit_img=relit_img,
-                    gt_img=gt_img,
-                    step=val_step,
-                    mode=f'{dataset_name}_validation'
+                input_img = input_img.to(args.gpu)
+                ref_img = ref_img.to(args.gpu)
+                gt_img = gt_img.to(args.gpu)
+                
+                # Forward pass (no noise for validation)
+                intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
+                intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
+                
+                # Reconstruct images
+                recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder=False).float()
+                recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
+                recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+                
+                # Compute same losses as training
+                rec_loss_total = compute_reconstruction_loss(
+                    [(recon_img_rr, ref_img), (recon_img_ir, gt_img), (recon_img_ii, input_img)], 
+                    ssim_loss
                 )
+                
+                logdet_pred, logdet_target = logdet_loss(intrinsic_input)
+                logdet_pred_ext, logdet_target_ext = logdet_loss_ext([extrinsic_input])
+                
+                logdet_reg_loss = args.reg_weight * ((logdet_pred - logdet_target) ** 2).mean()
+                logdet_ext_reg_loss = args.reg_weight * ((logdet_pred_ext - logdet_target_ext) ** 2).mean()
+                
+                sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
+                intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
+                
+                batch_total_loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + logdet_ext_reg_loss
+                
+                total_loss += batch_total_loss.item()
+                total_rec_loss += rec_loss_total.item()
+                total_logdet_int_loss += logdet_reg_loss.item()
+                total_logdet_ext_loss += logdet_ext_reg_loss.item()
+                total_intrinsic_loss += intrinsic_loss_component.item()
+                num_batches += 1
 
-                # Depth visualization if enabled
-                if args.enable_depth_loss and depth_loss_fn is not None:
+                # Log visualizations for first batch only
+                if args.is_master and not args.disable_wandb:
                     try:
-                        # Get depth maps
-                        depth_loss_value, input_depth, relit_depth = depth_loss_fn(input_img, correct_relit_img)
-                        
-                        # Create simple visualization
-                        depth_vis = depth_loss_fn.create_simple_visualization(
-                            input_img, correct_relit_img, input_depth, relit_depth, 
-                            epoch, dataset_name
+                        # Standard relighting visualization
+                        log_relighting_results(
+                            input_img=input_img,
+                            ref_img=ref_img,
+                            relit_img=recon_img_ir,
+                            gt_img=gt_img,
+                            step=current_step,  # Use current_step instead of epoch
+                            mode=f'{dataset_name}_validation'
                         )
                         
-                        if depth_vis is not None:
-                            wandb.log({
-                                f'{dataset_name}_depth_comparison': wandb.Image(
-                                    depth_vis, 
-                                    caption=f"Depth Comparison - {dataset_name} Epoch {epoch}"
-                                )
-                            }, step=val_step)
-                        
-                        # Add depth loss to metrics
-                        val_metrics[f'val_depth_loss'] = depth_loss_value.item()
-                        
+                        print(f"Successfully logged images for {dataset_name}")
                     except Exception as e:
-                        print(f"Warning: Depth analysis failed for {dataset_name}: {e}")
+                        print(f"Failed to log images for {dataset_name}: {e}")
+            
+            if num_batches > 0:
+                val_metrics = {
+                    f'val_{dataset_name}_total_loss': total_loss / num_batches,
+                    f'val_{dataset_name}_reconstruction_loss': total_rec_loss / num_batches,
+                    f'val_{dataset_name}_logdet_loss': total_logdet_int_loss / num_batches,
+                    f'val_{dataset_name}_intrinsic_loss': total_intrinsic_loss / num_batches,
+                    f'val_{dataset_name}_logdet_ext_loss': total_logdet_ext_loss / num_batches,
+                    f'val_epoch': epoch,
+                }
                 
-                # Log all metrics
-                if val_metrics:
-                    wandb.log(val_metrics, step=val_step)
+                if args.is_master and not args.disable_wandb:
+                    wandb.log(val_metrics, step=current_step)
+                    print(f"Validation metrics for {dataset_name}: {val_metrics}")
     
     model.train()
-    
-    next_step = current_step + min(len(val_loader), getattr(args, 'max_val_batches', 2))
-    return val_metrics, next_step
-
-
-def validate_multi_datasets(validation_loaders, model, epoch, args, current_step=None):
-    """Multi-dataset validation with proper step tracking"""
-    all_val_metrics = {}
-    
-    if current_step is None:
-        current_step = 0
-    
-    # Initialize depth loss function if needed
-    depth_loss_fn = None
-    if args.enable_depth_loss:
-        try:
-            depth_loss_fn = DepthConsistencyLoss(
-                model_name=getattr(args, 'depth_model_name', "depth-anything/Depth-Anything-V2-Small-hf"),
-                device=args.gpu
-            )
-        except Exception as e:
-            print(f"Warning: Could not initialize depth loss function: {e}")
-    
-    for dataset_name, val_loader in validation_loaders.items():
-        print(f"Validating on {dataset_name} dataset...")
-        
-        val_metrics, current_step = validate_D(
-            val_loader, model, epoch, args, 
-            current_step=current_step, 
-            dataset_name=dataset_name,
-            depth_loss_fn=depth_loss_fn
-        )
-        
-        # Add dataset prefix to metrics
-        prefixed_metrics = {f"{dataset_name}_{k}": v for k, v in val_metrics.items()}
-        all_val_metrics[dataset_name] = prefixed_metrics
-        
-        # Log dataset-specific metrics
-        if args.is_master and not args.disable_wandb:
-            wandb.log(prefixed_metrics, step=current_step-1)
-    
-    return all_val_metrics, current_step
 
 
 if __name__ == '__main__':

@@ -25,8 +25,7 @@ def compute_logdet(W, eps = 0.2):
 def intrinsic_loss(intrinsic1_list, intrinsic2_list):
     sim_intrinsic_list = []
     for intrinsic1, intrinsic2 in zip(intrinsic1_list, intrinsic2_list):
-        sim_intrinsic_list.append(((intrinsic1 - intrinsic2)**2).sum(dim = 1).mean())
-        #print(f"intrinsic1 shape: {intrinsic1.sum(dim=1).shape}, intrinsic2 shape: {intrinsic2.shape})")
+        sim_intrinsic_list.append((intrinsic1 * intrinsic2).sum(dim = 1).mean())
     return torch.stack(sim_intrinsic_list).mean()
 
 class compute_logdet_loss():
