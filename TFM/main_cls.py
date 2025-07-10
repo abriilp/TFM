@@ -166,12 +166,22 @@ parser.add_argument("--keep_last", type=int, default=3,
                     help="Keep only the last N checkpoints (0 to keep all)")
 
 # Depth params
-parser.add_argument("--depth_loss_weight", type=float, default=1e-2,
+parser.add_argument("--depth_loss_weight", type=float, default=1e-1,
                     help="Weight for depth consistency loss")
 parser.add_argument("--depth_model_name", type=str, default="depth-anything/Depth-Anything-V2-Small-hf",
                     help="Depth Anything model variant")
 parser.add_argument("--enable_depth_loss", action='store_true',
                     help="Enable depth consistency loss")
+
+# Normals params
+parser.add_argument('--enable_normal_loss', action='store_true', 
+                       help='Enable normal consistency loss')
+parser.add_argument('--normal_loss_weight', type=float, default=0.1,
+                       help='Weight for normal consistency loss')
+parser.add_argument('--normals_model_name', type=str, 
+                       default='GonzaloMG/marigold-e2e-ft-normals',
+                       help='Hugging Face model name for normal estimation')
+
 
 args = parser.parse_args()
 
@@ -180,7 +190,8 @@ def init_model(args):
     model = UNet(img_resolution=256, in_channels=3, out_channels=3,
                  num_blocks_list=[1, 2, 2, 4, 4, 4], attn_resolutions=[0], model_channels=32,
                  channel_mult=[1, 2, 4, 4, 8, 16], affine_scale=float(args.affine_scale))
-    print("Model architecture:", model)
+    if args.is_master:
+        wandb.watch(model, log='all', log_freq=100)
     model.cuda(args.gpu)
     ema_model = copy.deepcopy(model)
     ema_model.cuda(args.gpu)
@@ -191,14 +202,18 @@ def init_model(args):
     init_ema_model(model, ema_model)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
-    depth_loss_fn = None
-    if args.enable_depth_loss:
-        depth_loss_fn = DepthConsistencyLoss(
-            model_name=args.depth_model_name, 
-            device=args.gpu
+    # Enhanced depth and normal loss
+    depth_normal_loss_fn = None
+    if getattr(args, 'enable_depth_loss', False) or getattr(args, 'enable_normal_loss', False):
+        depth_normal_loss_fn = DepthNormalConsistencyLoss(
+            depth_model_name=getattr(args, 'depth_model_name', 'depth-anything/Depth-Anything-V2-Small-hf'),
+            normals_model_name=getattr(args, 'normals_model_name', 'GonzaloMG/marigold-e2e-ft-normals'),
+            device=args.gpu,
+            enable_depth=getattr(args, 'enable_depth_loss', False),
+            enable_normals=getattr(args, 'enable_normal_loss', False)
         )
 
-    return model, ema_model, optimizer, depth_loss_fn
+    return model, ema_model, optimizer, depth_normal_loss_fn
 
 
 def main():
@@ -312,6 +327,7 @@ def main_worker(gpu, ngpus_per_node, args):
             "channel_mult": [1, 2, 4, 4, 8, 16],
             "num_blocks_list": [1, 2, 2, 4, 4, 4],
             "enable_depth_loss": args.enable_depth_loss,
+            "enable_normal_loss": args.enable_normal_loss,
             "viz_log_freq": getattr(args, 'viz_log_freq', 50),
             "max_viz_images": getattr(args, 'max_viz_images', 4),
             "validation_datasets": getattr(args, 'validation_datasets', ['mit', 'rsr_256']),
@@ -322,6 +338,10 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.enable_depth_loss:
             config["depth_loss_weight"] = args.depth_loss_weight
             config["depth_model_name"] = args.depth_model_name
+        
+        if args.enable_normal_loss:
+            config["normal_loss_weight"] = args.normal_loss_weight
+            config["normals_model_name"] = args.normals_model_name
 
         wandb.init(
             project=args.wandb_project,
@@ -331,8 +351,9 @@ def main_worker(gpu, ngpus_per_node, args):
         )
 
     # Initialize model and optimizer
-    model, ema_model, optimizer, depth_loss_fn = init_model(args)
+    model, ema_model, optimizer, depth_normal_loss_fn = init_model(args)
     torch.cuda.set_device(args.gpu)
+    
     scaler = torch.cuda.amp.GradScaler()
 
     # Load checkpoint if available (but reset counters)
@@ -361,12 +382,12 @@ def main_worker(gpu, ngpus_per_node, args):
         
         # Training
         global_step = train_epoch(train_loader, model, scaler, optimizer, ema_model, 
-                                  epoch, args, global_step, depth_loss_fn, is_finetuning)
+                                  epoch, args, global_step, depth_normal_loss_fn, is_finetuning)
         
-        # Validation every 5 epochs
+        # Validation every "x" epochs
         if epoch % 3 == 0 or epoch == 0:
             print(f"Running validation at epoch {epoch}")
-            validate_multi_datasets(validation_loaders, model, epoch, args, global_step)
+            validate_multi_datasets(validation_loaders, model, epoch, args, global_step, depth_normal_loss_fn=depth_normal_loss_fn)
         
         # Save checkpoint
         if args.is_master and (epoch % args.save_every == 0 or epoch == args.epochs - 1):
@@ -469,9 +490,11 @@ def setup_data_loaders(train_dataset, val_dataset, args):
     return train_loader, validation_loaders
 
 
-def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_loss_fn, is_finetuning):
+import time
+
+def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_normal_loss_fn, is_finetuning):
     """Train for one epoch"""
-    loss_metrics = ['loss', 'reconstruction', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss']
+    loss_metrics = ['loss', 'reconstruction', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss', 'normal_loss']
     meters = [AverageMeter(name, ':6.3f') for name in loss_metrics]
     progress = ProgressMeter(len(train_loader), meters, prefix=f"Epoch: [{epoch}]")
 
@@ -487,7 +510,12 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
     ssim_loss = compute_SSIM_loss()
 
     for i, (input_img, ref_img) in enumerate(train_loader):
+        """if i>=5:
+            break  # Limit to first 5 batches for debugging"""
         current_step = global_step + i
+        
+        # Start timing the step
+        step_start_time = time.time()
         
         input_img = input_img.to(args.gpu)
         ref_img = ref_img.to(args.gpu)
@@ -501,7 +529,8 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         noisy_input_img = input_img + torch.randn_like(input_img) * sigma
         noisy_ref_img = ref_img + torch.randn_like(ref_img) * sigma
 
-        # Forward pass
+        # Forward pass timing
+        forward_start_time = time.time()
         with torch.cuda.amp.autocast():
             intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder=True)
             intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder=True)
@@ -511,7 +540,10 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
             recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
             recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder=False).float()
             recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+        forward_time = time.time() - forward_start_time
 
+        # Loss computation timing
+        loss_start_time = time.time()
         # Compute losses
         rec_loss_total = compute_reconstruction_loss(
             [(recon_img_rr, ref_img), (recon_img_ir, ref_img), 
@@ -528,29 +560,48 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
         intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
         
-        # Depth loss
+        # Enhanced depth and normal loss
         depth_loss_value = torch.tensor(0.0, device=input_img.device)
-        if args.enable_depth_loss and depth_loss_fn is not None and i % 5 == 0:
-            try:
-                depth_loss_value, _, _ = depth_loss_fn(input_img, recon_img_ri)
-                if not isinstance(depth_loss_value, torch.Tensor):
-                    depth_loss_value = torch.tensor(depth_loss_value, device=input_img.device)
-            except Exception as e:
-                print(f"Warning: Depth loss computation failed: {e}")
-                depth_loss_value = torch.tensor(0.0, device=input_img.device)
-
-        depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
+        normal_loss_value = torch.tensor(0.0, device=input_img.device)
         
-        # Total loss
-        total_loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + depth_loss_component + logdet_ext_reg_loss
+        if depth_normal_loss_fn is not None:
+            try:
+                #total_geom_loss, depth_loss_component, normal_loss_component = depth_normal_loss_fn(input_img, recon_img_ri)
+                
+                # You can separate depth and normal losses if needed by calling them individually
+                if getattr(args, 'enable_depth_loss', False) and getattr(args, 'enable_normal_loss', False):
+                    # Both enabled
+                    total_geom_loss, depth_loss_value, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+                elif getattr(args, 'enable_depth_loss', False):
+                    total_geom_loss, depth_loss_value, _, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+                elif getattr(args, 'enable_normal_loss', False):
+                    total_geom_loss, _, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+                    
+            except Exception as e:
+                print(f"Warning: Depth/Normal loss computation failed: {e}")
+                total_geom_loss = torch.tensor(0.0, device=input_img.device)
 
-        # Backward pass
+        # Combine geometric losses
+        depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
+        normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
+       
+        # Total loss
+        total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
+                     depth_loss_component + normal_loss_component + logdet_ext_reg_loss)
+        loss_time = time.time() - loss_start_time
+
+        # Backward pass timing
+        backward_start_time = time.time()
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
         update_ema_model(model, ema_model, 0.999)
+        backward_time = time.time() - backward_start_time
+        
+        # Calculate total step time
+        step_time = time.time() - step_start_time
 
         # Log metrics
         if args.is_master and not args.disable_wandb and i % args.log_freq == 0:
@@ -561,9 +612,16 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
                 'intrinsic_loss': intrinsic_loss_component.item(),
                 'logdet_ext_loss': logdet_ext_reg_loss.item(),
                 'depth_loss': depth_loss_component.item(),
+                'normal_loss': normal_loss_component.item(),
                 'learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'is_finetuning': is_finetuning,
+                # Timing metrics
+                'step_time': step_time,
+                'forward_time': forward_time,
+                'loss_time': loss_time,
+                'backward_time': backward_time,
+                'steps_per_second': 1.0 / step_time if step_time > 0 else 0.0,
             }
             wandb.log(metrics, step=current_step)
 
@@ -574,12 +632,15 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         meters[3].update(logdet_ext_reg_loss.item())
         meters[4].update(intrinsic_loss_component.item())
         meters[5].update(depth_loss_component.item())
+        meters[6].update(normal_loss_component.item())
         
         if i % 50 == 0:
             progress.display(i)
+        
 
     torch.distributed.barrier()
     return global_step + len(train_loader)
+
 
 
 def compute_reconstruction_loss(recon_pairs, ssim_loss):
@@ -593,7 +654,7 @@ def compute_reconstruction_loss(recon_pairs, ssim_loss):
     return total_loss / len(recon_pairs)
 
 
-def validate_multi_datasets(validation_loaders, model, epoch, args, current_step):
+def validate_multi_datasets(validation_loaders, model, epoch, args, current_step, depth_normal_loss_fn=None):
     """Validation using the same losses as training"""
     model.eval()
     
@@ -612,6 +673,8 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
             total_logdet_int_loss = 0
             total_logdet_ext_loss = 0
             total_intrinsic_loss = 0
+            total_depth_loss = 0
+            total_normal_loss = 0
             num_batches = 0
 
             total_val_batches = len(val_loader)
@@ -654,18 +717,47 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 
                 sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
                 intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
+
+                # Depth and normal loss for validation
+                depth_loss_value = torch.tensor(0.0, device=input_img.device)
+                normal_loss_value = torch.tensor(0.0, device=input_img.device)
+                input_depth, relit_depth = None, None
+                input_normals, relit_normals = None, None
                 
-                batch_total_loss = rec_loss_total + logdet_reg_loss + intrinsic_loss_component + logdet_ext_reg_loss
+                if depth_normal_loss_fn is not None:
+                    try:
+                        #total_geom_loss, depth_loss_component, normal_loss_component = depth_normal_loss_fn(input_img, recon_img_ri)
+                        
+                        # You can separate depth and normal losses if needed by calling them individually
+                        if getattr(args, 'enable_depth_loss', False) and getattr(args, 'enable_normal_loss', False):
+                            # Both enabled
+                            total_geom_loss, depth_loss_value, normal_loss_value, input_depth, relit_depth, input_normals, relit_normals = depth_normal_loss_fn(input_img, recon_img_ir)
+                        elif getattr(args, 'enable_depth_loss', False):
+                            total_geom_loss, depth_loss_value, _, input_depth, relit_depth, _, _= depth_normal_loss_fn(input_img, recon_img_ir)
+                        elif getattr(args, 'enable_normal_loss', False):
+                            total_geom_loss, _, normal_loss_value, _, _, input_normals, relit_normals = depth_normal_loss_fn(input_img, recon_img_ir)
+                            
+                    except Exception as e:
+                        print(f"Warning: Depth/Normal loss computation failed: {e}")
+                        total_geom_loss = torch.tensor(0.0, device=input_img.device)
+                
+                depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
+                normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
+                
+                batch_total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
+                                  logdet_ext_reg_loss + depth_loss_component + normal_loss_component)
                 
                 total_loss += batch_total_loss.item()
                 total_rec_loss += rec_loss_total.item()
                 total_logdet_int_loss += logdet_reg_loss.item()
                 total_logdet_ext_loss += logdet_ext_reg_loss.item()
                 total_intrinsic_loss += intrinsic_loss_component.item()
+                total_depth_loss += depth_loss_component.item()
+                total_normal_loss += normal_loss_component.item()
                 num_batches += 1
-
+                
                 # Log visualizations for first batch only
-                if args.is_master and not args.disable_wandb:
+                if i == 0 and args.is_master and not args.disable_wandb:
                     try:
                         # Standard relighting visualization
                         log_relighting_results(
@@ -673,9 +765,33 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                             ref_img=ref_img,
                             relit_img=recon_img_ir,
                             gt_img=gt_img,
-                            step=current_step,  # Use current_step instead of epoch
+                            step=current_step,
                             mode=f'{dataset_name}_validation'
                         )
+                        
+                        # Depth and normal visualization
+                        if depth_normal_loss_fn is not None and (input_depth is not None or input_normals is not None):
+                            vis_image = depth_normal_loss_fn.create_comprehensive_visualization(
+                                input_img=input_img,
+                                relit_img=recon_img_ir,
+                                gt_img=gt_img,
+                                input_depth=input_depth,
+                                relit_depth=relit_depth,
+                                gt_depth=depth_normal_loss_fn.get_depth_map(gt_img),
+                                input_normals=input_normals,
+                                relit_normals=relit_normals,
+                                gt_normals=depth_normal_loss_fn.get_normal_map(gt_img),
+                                epoch=epoch,
+                                dataset_name=f'{dataset_name}_validation'
+                            )
+                            
+                            if vis_image is not None:
+                                wandb.log({
+                                    f'{dataset_name}_depth_normal_comparison': wandb.Image(
+                                        vis_image, 
+                                        caption=f"{dataset_name} Validation Depth/Normal Comparison - Epoch {epoch}"
+                                    )
+                                }, step=current_step)
                         
                         print(f"Successfully logged images for {dataset_name}")
                     except Exception as e:
@@ -688,6 +804,8 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                     f'val_{dataset_name}_logdet_loss': total_logdet_int_loss / num_batches,
                     f'val_{dataset_name}_intrinsic_loss': total_intrinsic_loss / num_batches,
                     f'val_{dataset_name}_logdet_ext_loss': total_logdet_ext_loss / num_batches,
+                    f'val_{dataset_name}_depth_loss': total_depth_loss / num_batches,
+                    f'val_{dataset_name}_normal_loss': total_normal_loss / num_batches,
                     f'val_epoch': epoch,
                 }
                 

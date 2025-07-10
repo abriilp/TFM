@@ -63,6 +63,18 @@ from dataset_utils import *
 # wandb import
 import wandb
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from diffusers import DiffusionPipeline
+from PIL import Image
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib
+
 class affine_crop_resize(torchvision.transforms.RandomResizedCrop):
     def __init__(self, size, flip = True, **kargs):
         self.size = size
@@ -946,54 +958,103 @@ def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scale
 
     #depth
 
-class DepthConsistencyLoss(torch.nn.Module):
-    """Clean depth consistency loss with simple visualization"""
+class DepthNormalConsistencyLoss(torch.nn.Module):
+    """Enhanced loss with both depth and normal consistency"""
     
-    def __init__(self, model_name="depth-anything/Depth-Anything-V2-Small-hf", device='cuda'):
+    def __init__(self, 
+                 depth_model_name="depth-anything/Depth-Anything-V2-Small-hf",
+                 normals_model_name="GonzaloMG/marigold-e2e-ft-normals",
+                 device='cuda',
+                 enable_depth=True,
+                 enable_normals=True):
         super().__init__()
         self.device = device
+        self.enable_depth = enable_depth
+        self.enable_normals = enable_normals
         
-        # Load Depth Anything model
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
-        self.depth_model = AutoModelForDepthEstimation.from_pretrained(model_name)
-        self.depth_model.to(device)
-        self.depth_model.eval()
+        # Load Depth model if enabled
+        if self.enable_depth:
+            self.processor = AutoImageProcessor.from_pretrained(depth_model_name)
+            self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_model_name)
+            self.depth_model.to(device)
+            self.depth_model.eval()
+            
+            # Freeze depth model parameters
+            for param in self.depth_model.parameters():
+                param.requires_grad = False
         
-        # Freeze depth model parameters
-        for param in self.depth_model.parameters():
-            param.requires_grad = False
+        # Load Normal model if enabled
+        if self.enable_normals:
+            self.normal_pipe = DiffusionPipeline.from_pretrained(
+                normals_model_name,
+                custom_pipeline="GonzaloMG/marigold-e2e-ft-normals",
+                torch_dtype=torch.float16 if device == 'cuda' else torch.float32
+            ).to(device)
+            self.normal_pipe.set_progress_bar_config(disable=True)
+            
+            # Freeze normal model parameters
+            for param in self.normal_pipe.unet.parameters():
+                param.requires_grad = False
+            for param in self.normal_pipe.vae.parameters():
+                param.requires_grad = False
 
     def forward(self, img1, img2):
         """
-        Compute depth consistency loss between two images
+        Compute depth and/or normal consistency loss between two images
         img1, img2: (B, C, H, W) in range [-1, 1]
         """
-        depth1 = self.get_depth_map(img1.detach())
-        depth2 = self.get_depth_map(img2)
+        total_loss = torch.tensor(0.0, device=img1.device)
+        depth1, depth2 = None, None
+        normals1, normals2 = None, None
+        depth_loss, normal_loss = None, None
         
-        # Normalize depth maps to [0, 1] for better comparison
-        depth1_norm = self.normalize_depth_maps(depth1)
-        depth2_norm = self.normalize_depth_maps(depth2)
+        # Depth consistency loss
+        if self.enable_depth:
+            depth1 = self.get_depth_map(img1.detach())
+            depth2 = self.get_depth_map(img2)
+            
+            # Normalize depth maps to [0, 1] for better comparison
+            depth1_norm = self.normalize_depth_maps(depth1)
+            depth2_norm = self.normalize_depth_maps(depth2)
+            
+            # Compute L1 loss between depth maps
+            depth_loss = F.l1_loss(depth1_norm, depth2_norm)
+            total_loss += depth_loss
         
-        # Compute L1 loss between depth maps
-        depth_loss = F.l1_loss(depth1_norm, depth2_norm)
+        # Normal consistency loss
+        if self.enable_normals:
+            normals1 = self.get_normal_map(img1.detach())
+            normals2 = self.get_normal_map(img2)
+            
+            # Normalize normal maps if needed
+            normals1_norm = self.normalize_normal_maps(normals1)
+            normals2_norm = self.normalize_normal_maps(normals2)
+            
+            # Compute angular loss between normal maps (cosine similarity)
+            normal_loss = self.compute_normal_loss(normals1_norm, normals2_norm)
+            total_loss += normal_loss
+
+       #print(f"SHAPES: Normals input --> {normals1_norm.shape}, Normals relight --> {normals2_norm.shape}, Depth input --> {depth1_norm.shape}, Depth relight --> {depth2_norm.shape}")
         
-        return depth_loss, depth1_norm, depth2_norm
+        return total_loss, depth_loss, normal_loss, depth1, depth2, normals1, normals2
     
     def preprocess_image(self, img_tensor):
-        """Convert tensor from [-1, 1] to [0, 255] and prepare for depth model"""
+        """Convert tensor from [-1, 1] to PIL Image format"""
         # Convert from [-1, 1] to [0, 1]
         img_normalized = (img_tensor + 1.0) / 2.0
         # Convert to [0, 255]
         img_255 = (img_normalized * 255.0).clamp(0, 255)
         
-        # Convert to PIL format for processor (B, H, W, C)
+        # Convert to PIL format
         img_pil_format = img_255.permute(0, 2, 3, 1).detach().cpu().numpy().astype('uint8')
         
         return img_pil_format
     
     def get_depth_map(self, img_tensor):
         """Get depth map from image tensor"""
+        if not self.enable_depth:
+            return None
+            
         batch_size = img_tensor.shape[0]
         original_device = img_tensor.device
         
@@ -1027,8 +1088,54 @@ class DepthConsistencyLoss(torch.nn.Module):
         depth_result = torch.cat(depth_maps, dim=0)
         return depth_result.to(original_device)
     
+    def get_normal_map(self, img_tensor):
+        """Get normal map from image tensor using the marigold pipeline"""
+        if not self.enable_normals:
+            return None
+            
+        batch_size = img_tensor.shape[0]
+        original_device = img_tensor.device
+        
+        # Convert tensor to PIL images
+        with torch.no_grad():
+            img_array = self.preprocess_image(img_tensor)
+        
+        normal_maps = []
+        
+        with torch.no_grad():
+            for i in range(batch_size):
+                # Convert to PIL Image
+                pil_img = Image.fromarray(img_array[i])
+                
+                # Get normal prediction
+                result = self.normal_pipe(pil_img)
+                normal_prediction = result.prediction
+
+                # Convert to tensor format (B, C, H, W) - normals are in [-1, 1] range
+                if isinstance(normal_prediction, torch.Tensor):
+                    normal_tensor = normal_prediction
+                else:
+                    # Convert PIL to tensor if needed
+                    #normal_array = np.array(normal_prediction)
+                    normal_tensor = torch.from_numpy(normal_prediction).float()
+                    # Normalize from [0, 255] to [-1, 1] if needed
+                    if normal_tensor.max() > 1.0:
+                        normal_tensor = (normal_tensor / 255.0) * 2.0 - 1.0
+                
+                # Ensure tensor is on correct device before interpolation
+                normal_tensor = normal_tensor.to(self.device).permute(0, 3, 1, 2)
+                
+                normal_maps.append(normal_tensor)
+        
+        # Concatenate and ensure it's on the original device
+        normal_result = torch.cat(normal_maps, dim=0)
+        return normal_result.to(original_device)
+    
     def normalize_depth_maps(self, depth_maps):
         """Normalize depth maps to [0, 1] per image"""
+        if depth_maps is None:
+            return None
+            
         normalized = torch.zeros_like(depth_maps)
         for i in range(depth_maps.shape[0]):
             d = depth_maps[i]
@@ -1039,64 +1146,134 @@ class DepthConsistencyLoss(torch.nn.Module):
                 normalized[i] = d
         return normalized
     
-    def create_simple_visualization(self, input_img, relit_img, input_depth, relit_depth, epoch, dataset_name='validation'):
-        """Create simple visualization with input/relit images and their depths"""
-        try:
-            import matplotlib.pyplot as plt
-            import matplotlib
-            import numpy as np
+    def normalize_normal_maps(self, normal_maps):
+        """Normalize normal maps to unit length"""
+        if normal_maps is None:
+            return None
             
+        # Ensure normals are unit vectors
+        norm = torch.norm(normal_maps, dim=1, keepdim=True)
+        normalized = normal_maps / (norm + 1e-8)
+        return normalized
+    
+    def compute_normal_loss(self, normals1, normals2):
+        """Compute angular loss between normal maps using cosine similarity"""
+        # Compute cosine similarity (dot product for unit vectors)
+        cos_sim = torch.sum(normals1 * normals2, dim=1, keepdim=True)
+        
+        # Clamp to avoid numerical issues
+        cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+        
+        # Angular loss: 1 - cos_sim (0 for identical, 2 for opposite)
+        angular_loss = 1.0 - cos_sim
+        
+        return angular_loss.mean()
+    
+    def create_comprehensive_visualization(self, input_img, relit_img, gt_img, input_depth=None, relit_depth=None, gt_depth=None,
+                                        input_normals=None, relit_normals=None, gt_normals=None, epoch=0, dataset_name='validation'):
+        """Create comprehensive visualization with 3 columns: Input, Relit, GT"""
+        try:
             # Take first image from batch for visualization
             input_vis = self.tensor_to_numpy(input_img[0])
             relit_vis = self.tensor_to_numpy(relit_img[0])
-            input_depth_vis = input_depth[0, 0].cpu().numpy()
-            relit_depth_vis = relit_depth[0, 0].cpu().numpy()
+            gt_vis = self.tensor_to_numpy(gt_img[0])
             
-            # Create 2x2 grid
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle(f'{dataset_name} - Depth Comparison (Epoch {epoch})', fontsize=14, fontweight='bold')
+            # Determine number of rows based on available data
+            n_rows = 1  # Always have image row
+            has_depth = input_depth is not None and relit_depth is not None and gt_depth is not None
+            has_normals = input_normals is not None and relit_normals is not None and gt_normals is not None
             
-            # Input image
-            axes[0, 0].imshow(input_vis)
-            axes[0, 0].set_title('Input Image')
-            axes[0, 0].axis('off')
+            if has_depth:
+                n_rows += 1
+            if has_normals:
+                n_rows += 1
             
-            # Relit image
-            axes[0, 1].imshow(relit_vis)
-            axes[0, 1].set_title('Relit Image')
-            axes[0, 1].axis('off')
+            n_cols = 3  # Always 3 columns: Input, Relit, GT
             
-            # Input depth
-            im1 = axes[1, 0].imshow(input_depth_vis, cmap='plasma')
-            axes[1, 0].set_title('Input Depth')
-            axes[1, 0].axis('off')
-            plt.colorbar(im1, ax=axes[1, 0], fraction=0.046, pad=0.04)
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows))
+            fig.suptitle(f'{dataset_name} - Input vs Relit vs GT Comparison (Epoch {epoch})', fontsize=16, fontweight='bold')
             
-            # Relit depth
-            im2 = axes[1, 1].imshow(relit_depth_vis, cmap='plasma')
-            axes[1, 1].set_title('Relit Depth')
-            axes[1, 1].axis('off')
-            plt.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
+            # Ensure axes is 2D array
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            elif n_cols == 1:
+                axes = axes.reshape(-1, 1)
+            
+            current_row = 0
+            
+            # Row 1: Images
+            axes[current_row, 0].imshow(input_vis)
+            axes[current_row, 0].set_title('Input Image')
+            axes[current_row, 0].axis('off')
+            
+            axes[current_row, 1].imshow(relit_vis)
+            axes[current_row, 1].set_title('Relit Image')
+            axes[current_row, 1].axis('off')
+            
+            axes[current_row, 2].imshow(gt_vis)
+            axes[current_row, 2].set_title('Ground Truth')
+            axes[current_row, 2].axis('off')
+            
+            current_row += 1
+            
+            # Row 2: Depth maps (if available)
+            if has_depth:
+                input_depth_vis = input_depth[0, 0].cpu().numpy()
+                relit_depth_vis = relit_depth[0, 0].cpu().numpy()
+                gt_depth_vis = gt_depth[0, 0].cpu().numpy()
+                
+                # Find common depth range for consistent visualization
+                depth_min = min(input_depth_vis.min(), relit_depth_vis.min(), gt_depth_vis.min())
+                depth_max = max(input_depth_vis.max(), relit_depth_vis.max(), gt_depth_vis.max())
+                
+                im1 = axes[current_row, 0].imshow(input_depth_vis, cmap='plasma', vmin=depth_min, vmax=depth_max)
+                axes[current_row, 0].set_title('Input Depth')
+                axes[current_row, 0].axis('off')
+                plt.colorbar(im1, ax=axes[current_row, 0], fraction=0.046, pad=0.04)
+                
+                im2 = axes[current_row, 1].imshow(relit_depth_vis, cmap='plasma', vmin=depth_min, vmax=depth_max)
+                axes[current_row, 1].set_title('Relit Depth')
+                axes[current_row, 1].axis('off')
+                plt.colorbar(im2, ax=axes[current_row, 1], fraction=0.046, pad=0.04)
+                
+                im3 = axes[current_row, 2].imshow(gt_depth_vis, cmap='plasma', vmin=depth_min, vmax=depth_max)
+                axes[current_row, 2].set_title('GT Depth')
+                axes[current_row, 2].axis('off')
+                plt.colorbar(im3, ax=axes[current_row, 2], fraction=0.046, pad=0.04)
+                
+                current_row += 1
+            
+            # Row 3: Normal maps (if available)
+            if has_normals:
+                input_normals_vis = self.normal_to_rgb(input_normals[0])
+                relit_normals_vis = self.normal_to_rgb(relit_normals[0])
+                gt_normals_vis = self.normal_to_rgb(gt_normals[0])
+                
+                axes[current_row, 0].imshow(input_normals_vis)
+                axes[current_row, 0].set_title('Input Normals')
+                axes[current_row, 0].axis('off')
+                
+                axes[current_row, 1].imshow(relit_normals_vis)
+                axes[current_row, 1].set_title('Relit Normals')
+                axes[current_row, 1].axis('off')
+                
+                axes[current_row, 2].imshow(gt_normals_vis)
+                axes[current_row, 2].set_title('GT Normals')
+                axes[current_row, 2].axis('off')
             
             plt.tight_layout()
             
-            # Convert to image for wandb - Fixed method
+            # Convert to image for wandb
             fig.canvas.draw()
-            
-            # Try different methods based on matplotlib version
             try:
-                # Modern matplotlib (3.3+)
                 buf = fig.canvas.buffer_rgba()
                 buf = np.asarray(buf)
-                # Convert RGBA to RGB
-                buf = buf[:, :, :3]
+                buf = buf[:, :, :3]  # Remove alpha channel
             except AttributeError:
                 try:
-                    # Older matplotlib versions
                     buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
                     buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
                 except AttributeError:
-                    # Fallback method
                     import io
                     buf = io.BytesIO()
                     fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
@@ -1104,7 +1281,7 @@ class DepthConsistencyLoss(torch.nn.Module):
                     from PIL import Image
                     img = Image.open(buf)
                     buf = np.array(img)
-                    if buf.shape[-1] == 4:  # Remove alpha channel if present
+                    if buf.shape[-1] == 4:
                         buf = buf[:, :, :3]
             
             plt.close()
@@ -1113,8 +1290,15 @@ class DepthConsistencyLoss(torch.nn.Module):
         except Exception as e:
             print(f"Warning: Visualization failed: {e}")
             import traceback
-            traceback.print_exc()  # This will help debug the exact error
+            traceback.print_exc()
             return None
+    
+    def normal_to_rgb(self, normal_tensor):
+        """Convert normal map tensor to RGB for visualization"""
+        # Normalize from [-1, 1] to [0, 1]
+        normal_rgb = (normal_tensor + 1.0) / 2.0
+        normal_rgb = torch.clamp(normal_rgb, 0, 1)
+        return normal_rgb.permute(1, 2, 0).cpu().numpy()
     
     def tensor_to_numpy(self, tensor):
         """Convert tensor to numpy for visualization"""
@@ -1126,101 +1310,3 @@ class DepthConsistencyLoss(torch.nn.Module):
         tensor = torch.clamp(tensor, 0, 1)
         
         return tensor.permute(1, 2, 0).cpu().numpy()
-
-
-
-def analyze_depth_differences(model, val_loader, args, epoch, max_batches=None):
-    """
-    Function to integrate into your training loop for depth analysis
-    Uses the same DepthConsistencyLoss class for both loss computation and analysis
-    """
-    print("🔍 Starting comprehensive depth analysis...")
-    
-    # Initialize the enhanced depth consistency loss (same as used in training)
-    depth_analyzer = DepthConsistencyLoss(
-        model_name=getattr(args, 'depth_model_name', 'depth-anything/Depth-Anything-V2-Small-hf'),
-        device=args.gpu
-    )
-    
-    # Collect images from validation loader (ALL images if max_batches is None)
-    all_relit_imgs = []
-    all_gt_imgs = []
-    all_original_imgs = []
-    all_reference_imgs = []
-    
-    model.eval()
-    with torch.no_grad():
-        total_batches = len(val_loader) if max_batches is None else max_batches
-        for batch_idx, (img1, img2, img3) in enumerate(tqdm(val_loader, desc="Collecting validation images", total=total_batches)):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-                
-            img1 = img1.to(args.gpu)  # input/original
-            img2 = img2.to(args.gpu)  # target/gt
-            img3 = img3.to(args.gpu)  # reference lighting
-
-            # Generate relit images
-            intrinsic1, extrinsic1 = model(img1, run_encoder=True)
-            intrinsic3, extrinsic3 = model(img3, run_encoder=True)
-            relight_img2 = model([intrinsic1, extrinsic3], run_encoder=False).clamp(-1, 1)
-            
-            # Bias correction
-            shift = (relight_img2 - img2).mean(dim=[2, 3], keepdim=True)
-            correct_relight_img2 = relight_img2 - shift
-            
-            all_relit_imgs.append(correct_relight_img2)  # Keep on GPU
-            all_gt_imgs.append(img2)  # Keep on GPU
-            all_original_imgs.append(img1)  # Keep on GPU
-            all_reference_imgs.append(img3)  # Keep on GPU
-    
-    if len(all_relit_imgs) == 0:
-        print("No validation images collected!")
-        return None
-    
-    # Concatenate all images (keep on GPU for efficiency)
-    relit_imgs = torch.cat(all_relit_imgs, dim=0)
-    gt_imgs = torch.cat(all_gt_imgs, dim=0)
-    original_imgs = torch.cat(all_original_imgs, dim=0)
-    reference_imgs = torch.cat(all_reference_imgs, dim=0)
-    
-    print(f"Analyzing {relit_imgs.shape[0]} image pairs on GPU...")
-    
-    # Create output directory
-    analysis_dir = os.path.join(args.save_folder_path, f'depth_analysis_epoch_{epoch}')
-    
-    # Run comprehensive analysis (all images for stats, worst 8 for detailed analysis)
-    metrics = depth_analyzer.create_comprehensive_visualization(
-        relit_imgs, gt_imgs, original_imgs, reference_imgs, analysis_dir, 
-        max_images=8,  # Only for detailed analysis
-        analyze_worst=True
-    )
-    
-    print(f"✓ Depth analysis complete! Results saved to: {analysis_dir}")
-    print(f"📊 Analyzed {len(metrics['mse_per_image'])} images total")
-    print(f"📊 Average depth MSE: {metrics['avg_mse']:.6f}")
-    print(f"📊 Average depth SSIM: {metrics['avg_ssim']:.4f}")
-    print(f"📊 Worst MSE: {max(metrics['mse_per_image']):.6f}")
-    print(f"📊 Best MSE: {min(metrics['mse_per_image']):.6f}")
-    
-    # Log to wandb if available
-    if hasattr(args, 'is_master') and args.is_master and not getattr(args, 'disable_wandb', False):
-        try:
-            import wandb
-            wandb.log({
-                'depth_analysis/total_images_analyzed': len(metrics['mse_per_image']),
-                'depth_analysis/avg_mse': metrics['avg_mse'],
-                'depth_analysis/avg_mae': metrics['avg_mae'],
-                'depth_analysis/avg_ssim': metrics['avg_ssim'],
-                'depth_analysis/avg_gradient_error': metrics['avg_gradient_error'],
-                'depth_analysis/worst_mse': max(metrics['mse_per_image']),
-                'depth_analysis/best_mse': min(metrics['mse_per_image']),
-                'depth_analysis/mse_std': np.std(metrics['mse_per_image']),
-                'depth_analysis/worst_ssim': min(metrics['ssim_per_image']),
-                'depth_analysis/best_ssim': max(metrics['ssim_per_image']),
-                'epoch': epoch
-            })
-        except:
-            print("Could not log to wandb")
-    
-    model.train()
-    return metrics
