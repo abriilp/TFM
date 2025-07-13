@@ -45,6 +45,10 @@ import tqdm
 from utils import MIT_Dataset_Normal, MIT_Dataset,affine_crop_resize
 from skimage.metrics import structural_similarity as ssim
 
+from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
+import lpips
+from skimage import color
+
 class DINO_extractor():
     def __init__(self, device):
         from dino import DinoFeaturizer
@@ -122,6 +126,27 @@ def get_eval_relight_dataloder(args, eval_pair_folder_shift = 5, eval_pair_light
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=64, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last = False, persistent_workers = False)
+    return train_loader
+
+def get_eval_relight_dataloder2(args, eval_pair_folder_shift = 5, eval_pair_light_shift = 5):
+    transform_test = [
+        None, 
+        transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    ]
+    from dataset_utils import RSRDataset
+    train_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_test, 
+                                is_validation=True, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
+    #test_dataset = VIDIT_Dataset_val('/net/projects/willettlab/roxie62/dataset/VIDIT', transform_test)
+    print('NUM of training images: {}'.format(len(train_dataset)))
+    train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=1, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last = False, persistent_workers = False)
     return train_loader
 
@@ -319,16 +344,27 @@ def eval_ssl_surface(args):
 @torch.no_grad()
 def eval_relight(args, epoch, model, eval_pair_folder_shift = 5, eval_pair_light_shift = 5):
     torch.manual_seed(args.gpu)
-    train_loader = get_eval_relight_dataloder(args, eval_pair_folder_shift, eval_pair_light_shift)
+    train_loader = get_eval_relight_dataloder2(args, eval_pair_folder_shift, eval_pair_light_shift)
     t0 = time.time()
     epoch_iter = len(train_loader)
     P_mean=-0.5
     P_std=1.2
-    recon_error = []
-    ssim_list = []
-    correct_recon_error = []
-    correct_ssim_list = []
     model.eval()
+
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(args.gpu)
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(args.gpu)
+    lpips_metric = lpips.LPIPS(net='alex').to(args.gpu)
+    delta_e_metric = deltaE00()
+
+    # Metrics accumulation
+    ssim_scores = []
+    psnr_scores = []
+    lpips_scores = []
+    delta_e_scores = []
+            
+    # Lists to store all metrics for wandb table
+    all_metrics = []
+    
     for i, (img1, img2, img3) in enumerate(tqdm.tqdm(train_loader)):
         img1 = img1.to(args.gpu)
         img2 = img2.to(args.gpu)
@@ -338,32 +374,120 @@ def eval_relight(args, epoch, model, eval_pair_folder_shift = 5, eval_pair_light
         sigma = (rnd_normal * P_std + P_mean).exp().to(img1.device) * 0 + 0.001
         noise = torch.randn_like(img1)
         noisy_img1 = img1 + noise * sigma
-        noisy_img3 = img3 + noise * sigma
+        noisy_img2 = img2 + noise * sigma
 
         intrinsic1, extrinsic1 = model(img1, run_encoder = True)
-        intrinsic3, extrinsic3 = model(img3, run_encoder = True)
-        relight_img2 = model([intrinsic1, extrinsic3], run_encoder = False).clamp(-1,1)
-        def save_img(img_list, name):
-            white_space = (np.ones((1280, 20, 3)).astype(np.float32) * 255).astype(np.uint8)
-            np_img_list = []
-            for img in img_list:
-                img = ((img[:25].clamp(-1,1) * 0.5 + 0.5).reshape(5,5, 3, 256, 256).permute(0,3, 1, 4, 2).reshape(1280, 1280, 3) * 255).cpu().data.numpy().astype(np.uint8)
-                np_img_list.append(img)
-                np_img_list.append(white_space)
-            Image.fromarray(np.concatenate(np_img_list, axis = 1)).save(f'{name}.png')
-
+        intrinsic2, extrinsic2 = model(img2, run_encoder = True)
+        relight_img2 = model([intrinsic1, extrinsic2], run_encoder = False).clamp(-1,1)
+  
         shift = (relight_img2 - img2).mean(dim = [2,3], keepdim = True)
         correct_relight_img2 = relight_img2 - shift
-        for i_idx in range(img2.shape[0]):
-            val = ssim(relight_img2[i_idx, :].cpu().data.numpy(), img2[i_idx, :].cpu().data.numpy(), data_range=2, channel_axis = 0)
-            ssim_list.append(val)
 
-        for i_idx in range(img2.shape[0]):
-            val = ssim(correct_relight_img2[i_idx, :].cpu().data.numpy(), img2[i_idx, :].cpu().data.numpy(), data_range=2, channel_axis = 0)
-            correct_ssim_list.append(val)
-        recon_error.append(torch.sqrt(torch.mean((relight_img2 - img2)**2,dim= [1,2,3])))
-        correct_recon_error.append(torch.sqrt(torch.mean((correct_relight_img2 - img2)**2,dim= [1,2,3])))
-    error = torch.cat(recon_error).mean().item()
-    correct_error = torch.cat(correct_recon_error).mean().item()
-    os.system(f'touch {args.save_folder_path}/correct_result_{epoch}_{error}_{np.array(ssim_list).mean()}_{correct_error}_{np.array(correct_ssim_list).mean()}')
-    return error, np.array(ssim_list).mean()
+        # Compute metrics
+        ssim_score = ssim_metric(correct_relight_img2, img3)
+        psnr_score = psnr_metric(correct_relight_img2, img3)
+        lpips_score = lpips_metric(correct_relight_img2, img3)
+        delta_e_score = delta_e_metric(correct_relight_img2, img3)
+                
+        # Accumulate scores
+        ssim_scores.append(ssim_score.item())
+        psnr_scores.append(psnr_score.item())
+        lpips_scores.append(lpips_score.item())
+        delta_e_scores.append(delta_e_score)
+
+    # Calculate average metrics
+    avg_ssim = np.mean(ssim_scores)
+    avg_psnr = np.mean(psnr_scores)
+    avg_lpips = np.mean(lpips_scores)
+    avg_delta_e = np.mean(delta_e_scores)
+
+    print(f"  SSIM: {avg_ssim:.4f}")
+    print(f"  PSNR: {avg_psnr:.4f}")
+    print(f"  LPIPS: {avg_lpips:.4f}")
+    print(f"  Delta E: {avg_delta_e:.4f}")
+    print(f"  Samples: {len(train_loader)}")
+        
+    return
+
+
+class deltaE00():
+    def __init__(self, color_chart_area=0):
+        super().__init__()
+        self.color_chart_area = color_chart_area
+        self.kl = 1
+        self.kc = 1
+        self.kh = 1
+
+    def __call__(self, img1, img2):
+        """ Compute the deltaE00 between two numpy RGB images """
+        
+        if type(img1) == torch.Tensor:
+            assert img1.shape[0] == 1
+            img1 = img1.squeeze().permute(1, 2, 0).cpu().numpy()
+
+        if type(img2) == torch.Tensor:
+            assert img2.shape[0] == 1
+            img2 = img2.squeeze().permute(1, 2, 0).cpu().numpy()
+
+        # Convert to Lab
+        img1 = color.rgb2lab(img1)
+        img2 = color.rgb2lab(img2)
+
+        # reshape to 1D array
+        img1 = img1.reshape(-1, 3).astype(np.float32)
+        img2 = img2.reshape(-1, 3).astype(np.float32)
+
+        # compute deltaE00
+        Lstd = np.transpose(img1[:, 0])
+        astd = np.transpose(img1[:, 1])
+        bstd = np.transpose(img1[:, 2])
+        Cabstd = np.sqrt(np.power(astd, 2) + np.power(bstd, 2))
+        Lsample = np.transpose(img2[:, 0])
+        asample = np.transpose(img2[:, 1])
+        bsample = np.transpose(img2[:, 2])
+        Cabsample = np.sqrt(np.power(asample, 2) + np.power(bsample, 2))
+        Cabarithmean = (Cabstd + Cabsample) / 2
+        G = 0.5 * (1 - np.sqrt((np.power(Cabarithmean, 7)) / (np.power(
+            Cabarithmean, 7) + np.power(25, 7))))
+        apstd = (1 + G) * astd
+        apsample = (1 + G) * asample
+        Cpsample = np.sqrt(np.power(apsample, 2) + np.power(bsample, 2))
+        Cpstd = np.sqrt(np.power(apstd, 2) + np.power(bstd, 2))
+        Cpprod = (Cpsample * Cpstd)
+        zcidx = np.argwhere(Cpprod == 0)
+        hpstd = np.arctan2(bstd, apstd)
+        hpstd[np.argwhere((np.abs(apstd) + np.abs(bstd)) == 0)] = 0
+        hpsample = np.arctan2(bsample, apsample)
+        hpsample = hpsample + 2 * np.pi * (hpsample < 0)
+        hpsample[np.argwhere((np.abs(apsample) + np.abs(bsample)) == 0)] = 0
+        dL = (Lsample - Lstd)
+        dC = (Cpsample - Cpstd)
+        dhp = (hpsample - hpstd)
+        dhp = dhp - 2 * np.pi * (dhp > np.pi)
+        dhp = dhp + 2 * np.pi * (dhp < (-np.pi))
+        dhp[zcidx] = 0
+        dH = 2 * np.sqrt(Cpprod) * np.sin(dhp / 2)
+        Lp = (Lsample + Lstd) / 2
+        Cp = (Cpstd + Cpsample) / 2
+        hp = (hpstd + hpsample) / 2
+        hp = hp - (np.abs(hpstd - hpsample) > np.pi) * np.pi
+        hp = hp + (hp < 0) * 2 * np.pi
+        hp[zcidx] = hpsample[zcidx] + hpstd[zcidx]
+        Lpm502 = np.power((Lp - 50), 2)
+        Sl = 1 + 0.015 * Lpm502 / np.sqrt(20 + Lpm502)
+        Sc = 1 + 0.045 * Cp
+        T = 1 - 0.17 * np.cos(hp - np.pi / 6) + 0.24 * np.cos(2 * hp) + \
+            0.32 * np.cos(3 * hp + np.pi / 30) \
+            - 0.20 * np.cos(4 * hp - 63 * np.pi / 180)
+        Sh = 1 + 0.015 * Cp * T
+        delthetarad = (30 * np.pi / 180) * np.exp(
+            - np.power((180 / np.pi * hp - 275) / 25, 2))
+        Rc = 2 * np.sqrt((np.power(Cp, 7)) / (np.power(Cp, 7) + np.power(25, 7)))
+        RT = - np.sin(2 * delthetarad) * Rc
+        klSl = self.kl * Sl
+        kcSc = self.kc * Sc
+        khSh = self.kh * Sh
+        de00 = np.sqrt(np.power((dL / klSl), 2) + np.power((dC / kcSc), 2) +
+                       np.power((dH / khSh), 2) + RT * (dC / kcSc) * (dH / khSh))
+
+        return np.sum(de00) / (np.shape(de00)[0] - self.color_chart_area)

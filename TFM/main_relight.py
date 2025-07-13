@@ -44,6 +44,12 @@ from pytorch_ssim import SSIM as compute_SSIM_loss
 from pytorch_losses import gradient_loss
 from model_utils import plot_relight_img_train, compute_logdet_loss, intrinsic_loss,save_checkpoint
 
+
+from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
+import lpips
+from skimage import color
+import wandb
+
 #from sklearn.metrics import average_precision_score
 warnings.filterwarnings("ignore")
 
@@ -90,16 +96,259 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 parser.add_argument("--learning_rate", type=float, default=1e-3)
-parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--weight_decay", type=float, default=0)
 # training params
 parser.add_argument("--gpus", type=int, default=1)
 # datamodule params
-parser.add_argument("--data_path", type=str, default=".")
-parser.add_argument("--load_ckpt", type=str, default=".")
+parser.add_argument("--data_path", type=str, default="/home/apinyol/TFM/Data/RSR_256")
+parser.add_argument("--load_ckpt", type=str, default="/home/apinyol/TFM/Models/last.pth.tar")
 
 args = parser.parse_args()
 
+
+class deltaE00():
+    def __init__(self, color_chart_area=0):
+        super().__init__()
+        self.color_chart_area = color_chart_area
+        self.kl = 1
+        self.kc = 1
+        self.kh = 1
+
+    def __call__(self, img1, img2):
+        """ Compute the deltaE00 between two numpy RGB images """
+        
+        if type(img1) == torch.Tensor:
+            assert img1.shape[0] == 1
+            img1 = img1.squeeze().permute(1, 2, 0).cpu().numpy()
+
+        if type(img2) == torch.Tensor:
+            assert img2.shape[0] == 1
+            img2 = img2.squeeze().permute(1, 2, 0).cpu().numpy()
+
+        # Convert to Lab
+        img1 = color.rgb2lab(img1)
+        img2 = color.rgb2lab(img2)
+
+        # reshape to 1D array
+        img1 = img1.reshape(-1, 3).astype(np.float32)
+        img2 = img2.reshape(-1, 3).astype(np.float32)
+
+        # compute deltaE00
+        Lstd = np.transpose(img1[:, 0])
+        astd = np.transpose(img1[:, 1])
+        bstd = np.transpose(img1[:, 2])
+        Cabstd = np.sqrt(np.power(astd, 2) + np.power(bstd, 2))
+        Lsample = np.transpose(img2[:, 0])
+        asample = np.transpose(img2[:, 1])
+        bsample = np.transpose(img2[:, 2])
+        Cabsample = np.sqrt(np.power(asample, 2) + np.power(bsample, 2))
+        Cabarithmean = (Cabstd + Cabsample) / 2
+        G = 0.5 * (1 - np.sqrt((np.power(Cabarithmean, 7)) / (np.power(
+            Cabarithmean, 7) + np.power(25, 7))))
+        apstd = (1 + G) * astd
+        apsample = (1 + G) * asample
+        Cpsample = np.sqrt(np.power(apsample, 2) + np.power(bsample, 2))
+        Cpstd = np.sqrt(np.power(apstd, 2) + np.power(bstd, 2))
+        Cpprod = (Cpsample * Cpstd)
+        zcidx = np.argwhere(Cpprod == 0)
+        hpstd = np.arctan2(bstd, apstd)
+        hpstd[np.argwhere((np.abs(apstd) + np.abs(bstd)) == 0)] = 0
+        hpsample = np.arctan2(bsample, apsample)
+        hpsample = hpsample + 2 * np.pi * (hpsample < 0)
+        hpsample[np.argwhere((np.abs(apsample) + np.abs(bsample)) == 0)] = 0
+        dL = (Lsample - Lstd)
+        dC = (Cpsample - Cpstd)
+        dhp = (hpsample - hpstd)
+        dhp = dhp - 2 * np.pi * (dhp > np.pi)
+        dhp = dhp + 2 * np.pi * (dhp < (-np.pi))
+        dhp[zcidx] = 0
+        dH = 2 * np.sqrt(Cpprod) * np.sin(dhp / 2)
+        Lp = (Lsample + Lstd) / 2
+        Cp = (Cpstd + Cpsample) / 2
+        hp = (hpstd + hpsample) / 2
+        hp = hp - (np.abs(hpstd - hpsample) > np.pi) * np.pi
+        hp = hp + (hp < 0) * 2 * np.pi
+        hp[zcidx] = hpsample[zcidx] + hpstd[zcidx]
+        Lpm502 = np.power((Lp - 50), 2)
+        Sl = 1 + 0.015 * Lpm502 / np.sqrt(20 + Lpm502)
+        Sc = 1 + 0.045 * Cp
+        T = 1 - 0.17 * np.cos(hp - np.pi / 6) + 0.24 * np.cos(2 * hp) + \
+            0.32 * np.cos(3 * hp + np.pi / 30) \
+            - 0.20 * np.cos(4 * hp - 63 * np.pi / 180)
+        Sh = 1 + 0.015 * Cp * T
+        delthetarad = (30 * np.pi / 180) * np.exp(
+            - np.power((180 / np.pi * hp - 275) / 25, 2))
+        Rc = 2 * np.sqrt((np.power(Cp, 7)) / (np.power(Cp, 7) + np.power(25, 7)))
+        RT = - np.sin(2 * delthetarad) * Rc
+        klSl = self.kl * Sl
+        kcSc = self.kc * Sc
+        khSh = self.kh * Sh
+        de00 = np.sqrt(np.power((dL / klSl), 2) + np.power((dC / kcSc), 2) +
+                       np.power((dH / khSh), 2) + RT * (dC / kcSc) * (dH / khSh))
+
+        return np.sum(de00) / (np.shape(de00)[0] - self.color_chart_area)
+
+def get_eval_relight_dataloder2(args, eval_pair_folder_shift = 5, eval_pair_light_shift = 5):
+    transform_test = [
+        None, 
+        transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    ]
+    from dataset_utils import RSRDataset
+    val_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_test, 
+                                is_validation=True, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
+    #test_dataset = VIDIT_Dataset_val('/net/projects/willettlab/roxie62/dataset/VIDIT', transform_test)
+    print('NUM of training images: {}'.format(len(val_dataset)))
+    val_sampler = None
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=1, shuffle=(val_sampler is None),
+        num_workers=args.workers, pin_memory=False, sampler=val_sampler, drop_last = False, persistent_workers = False)
+    return val_loader
+
+
+
+@torch.no_grad()
+def eval_relight(args, epoch, model, eval_pair_folder_shift = 5, eval_pair_light_shift = 5):
+    torch.manual_seed(args.gpu)
+    train_loader = get_eval_relight_dataloder2(args, eval_pair_folder_shift, eval_pair_light_shift)
+    t0 = time.time()
+    epoch_iter = len(train_loader)
+    P_mean=-0.5
+    P_std=1.2
+    model.eval()
+
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(args.gpu)
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(args.gpu)
+    lpips_metric = lpips.LPIPS(net='alex').to(args.gpu)
+    delta_e_metric = deltaE00()
+
+    # Metrics accumulation
+    ssim_scores = []
+    psnr_scores = []
+    lpips_scores = []
+    delta_e_scores = []
+            
+    # Lists to store all metrics for wandb table
+    all_metrics = []
+    wandb_images = []
+    
+    for i, (img1, img2, img3) in enumerate(tqdm.tqdm(train_loader)):
+        img1 = img1.to(args.gpu)  # Input image
+        img2 = img2.to(args.gpu)  # Reference image (different lighting)
+        img3 = img3.to(args.gpu)  # Ground truth (target lighting)
+
+        rnd_normal = torch.randn([img1.shape[0], 1, 1, 1], device=img1.device)
+        sigma = (rnd_normal * P_std + P_mean).exp().to(img1.device) * 0 + 0.001
+        noise = torch.randn_like(img1)
+        noisy_img1 = img1 + noise * sigma
+        noisy_img2 = img2 + noise * sigma
+
+        intrinsic1, extrinsic1 = model(img1, run_encoder = True)
+        intrinsic2, extrinsic2 = model(img2, run_encoder = True)
+        relight_img2 = model([intrinsic1, extrinsic2], run_encoder = False).clamp(-1,1)
+  
+        shift = (relight_img2 - img2).mean(dim = [2,3], keepdim = True)
+        correct_relight_img2 = relight_img2 - shift
+
+        # Compute metrics
+        ssim_score = ssim_metric(relight_img2, img3)
+        psnr_score = psnr_metric(relight_img2, img3)
+        lpips_score = lpips_metric(relight_img2, img3)
+        delta_e_score = delta_e_metric(relight_img2, img3)
+                
+        # Accumulate scores
+        ssim_scores.append(ssim_score.item())
+        psnr_scores.append(psnr_score.item())
+        lpips_scores.append(lpips_score.item())
+        delta_e_scores.append(delta_e_score)
+
+        # Prepare images for wandb logging (convert from [-1, 1] to [0, 1])
+        def normalize_for_display(img_tensor):
+            return (img_tensor + 1.0) / 2.0
+        
+        #print(f"Batch {i} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}")
+        batch_size = img1.shape[0]
+        for j in range(min(batch_size, 4)):  # Max 4 images per batch
+            # Create a grid of images: [Input, Reference, Relit, Ground Truth]
+            input_img = normalize_for_display(img1[j]).cpu()
+            ref_img = normalize_for_display(img2[j]).cpu()
+            relit_img = normalize_for_display(correct_relight_img2[j]).cpu()
+            gt_img = normalize_for_display(img3[j]).cpu()
+                
+            # Create a horizontal grid
+            grid_img = torch.cat([input_img, ref_img, relit_img, gt_img], dim=2)
+                
+            wandb_images.append(wandb.Image(
+                    grid_img,
+                    caption=f"Batch {i}, Sample {j} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}"
+                ))
+                
+            # Store metrics for table
+            all_metrics.append({
+                    "batch_idx": i,
+                    "sample_idx": j,
+                    "ssim": ssim_score.item(),
+                    "psnr": psnr_score.item(),
+                    "lpips": lpips_score.item(),
+                    "delta_e": delta_e_score,
+                    "input_reference_relit_gt": wandb.Image(grid_img, caption="Input | Reference | Relit | Ground Truth")
+                })
+
+    # Calculate average metrics
+    avg_ssim = np.mean(ssim_scores)
+    avg_psnr = np.mean(psnr_scores)
+    avg_lpips = np.mean(lpips_scores)
+    avg_delta_e = np.mean(delta_e_scores)
+
+    print(f"  SSIM: {avg_ssim:.4f}")
+    print(f"  PSNR: {avg_psnr:.4f}")
+    print(f"  LPIPS: {avg_lpips:.4f}")
+    print(f"  Delta E: {avg_delta_e:.4f}")
+    print(f"  Samples: {len(train_loader)}")
+    
+    wandb.log({
+            "eval/avg_ssim": avg_ssim,
+            "eval/avg_psnr": avg_psnr,
+            "eval/avg_lpips": avg_lpips,
+            "eval/avg_delta_e": avg_delta_e,
+            "eval/num_samples": len(train_loader),
+            "eval/epoch": epoch
+        })
+        
+    # Log image grids
+    wandb.log({
+            "eval/relight_results": wandb_images
+        })
+        
+    """# Create and log detailed results table
+    table = wandb.Table(columns=["batch_idx", "sample_idx", "ssim", "psnr", "lpips", "delta_e", "images"])
+    for metric_row in all_metrics:
+            table.add_data(
+                metric_row["batch_idx"],
+                metric_row["sample_idx"],
+                metric_row["ssim"],
+                metric_row["psnr"],
+                metric_row["lpips"],
+                metric_row["delta_e"],
+                metric_row["input_reference_relit_gt"]
+            )
+        
+    wandb.log({"eval/detailed_results": table})"""
+        
+    # Log metric distributions
+    wandb.log({
+            "eval/ssim_distribution": wandb.Histogram(ssim_scores),
+            "eval/psnr_distribution": wandb.Histogram(psnr_scores),
+            "eval/lpips_distribution": wandb.Histogram(lpips_scores),
+            "eval/delta_e_distribution": wandb.Histogram(delta_e_scores)
+        })
+        
+    return
 
 def init_model(args):
     model = UNet(img_resolution = 256, in_channels = 3, out_channels = 3,
@@ -180,6 +429,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
     args.is_master = args.rank == 0
 
+    # Initialize wandb (only on master process)
+    if args.rank == 0:
+        wandb.init(
+            project="relight_evaluation",
+            config=vars(args),
+            tags=["evaluation", "relight"]
+        )
+
     model, ema_model, optimizer = init_model(args)
     torch.cuda.set_device(args.gpu)
 
@@ -202,9 +459,12 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> no checkpoint found at '{}'!!!!!!!".format(args.load_ckpt))
 
-    from eval_utils import eval_relight
-    for i in range(12):
+    #from eval_utils import eval_relight
+    for i in range(1):
         eval_relight(args, 100, model)
+    
+    wandb.finish()
+    
     exit()
 
 if __name__ == '__main__':

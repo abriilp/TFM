@@ -127,6 +127,8 @@ class RSRDataset(Dataset):
         return len(self.all_images)
     
     def __getitem__(self, idx):
+        #print(f"Fetching item {idx} from dataset")
+        #print(f"Total images: {len(self.all_images)}")
         input_info = self.all_images[idx]
         input_path = input_info['path']
         input_scene = input_info['scene']
@@ -141,7 +143,7 @@ class RSRDataset(Dataset):
             # Get all images from scenes different from input scene
             cross_scene_images = []
             for scene_name, scene_data in self.image_data.items():
-                if scene_name != input_scene:  # Different scene
+                if scene_name != input_scene and scene_name in self.scenes:  # Different scene
                     for cam_pos, cam_data in scene_data.items():
                         for light_pos, img_paths in cam_data.items():
                             for img_path in img_paths:
