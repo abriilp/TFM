@@ -201,6 +201,8 @@ def get_eval_relight_dataloder2(args, eval_pair_folder_shift = 5, eval_pair_ligh
     from dataset_utils import RSRDataset
     val_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_test, 
                                 is_validation=True, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
+    val_dataset2 = MIT_Dataset('/home/apinyol/TFM/Data/multi_illumination_test_mip2_jpg', 
+                                 transform_test, eval_mode=True)
     #test_dataset = VIDIT_Dataset_val('/net/projects/willettlab/roxie62/dataset/VIDIT', transform_test)
     print('NUM of training images: {}'.format(len(val_dataset)))
     val_sampler = None
@@ -208,16 +210,18 @@ def get_eval_relight_dataloder2(args, eval_pair_folder_shift = 5, eval_pair_ligh
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=1, shuffle=(val_sampler is None),
         num_workers=args.workers, pin_memory=False, sampler=val_sampler, drop_last = False, persistent_workers = False)
-    return val_loader
+    val_loader2 = torch.utils.data.DataLoader(
+        val_dataset2, batch_size=1, shuffle=(val_sampler is None),
+        num_workers=args.workers, pin_memory=False, sampler=val_sampler, drop_last = False, persistent_workers = False)
+    return val_loader, val_loader2
 
 
 
 @torch.no_grad()
 def eval_relight(args, epoch, model, eval_pair_folder_shift = 5, eval_pair_light_shift = 5):
     torch.manual_seed(args.gpu)
-    train_loader = get_eval_relight_dataloder2(args, eval_pair_folder_shift, eval_pair_light_shift)
+    val_loader1, val_loader2 = get_eval_relight_dataloder2(args, eval_pair_folder_shift, eval_pair_light_shift)
     t0 = time.time()
-    epoch_iter = len(train_loader)
     P_mean=-0.5
     P_std=1.2
     model.eval()
@@ -236,117 +240,133 @@ def eval_relight(args, epoch, model, eval_pair_folder_shift = 5, eval_pair_light
     # Lists to store all metrics for wandb table
     all_metrics = []
     wandb_images = []
+    for val_loader in [val_loader2]: #val_loader1,
+        for i, (img1, img2, img3) in enumerate(tqdm.tqdm(val_loader)):
+            img1 = img1.to(args.gpu)  # Input image
+            img2 = img2.to(args.gpu)  # Reference image (different lighting)
+            img3 = img3.to(args.gpu)  # Ground truth (target lighting)
+
+            rnd_normal = torch.randn([img1.shape[0], 1, 1, 1], device=img1.device)
+            sigma = (rnd_normal * P_std + P_mean).exp().to(img1.device) * 0 + 0.001
+            noise = torch.randn_like(img1)
+            noisy_img1 = img1 + noise * sigma
+            noisy_img2 = img2 + noise * sigma
+
+            intrinsic1, extrinsic1 = model(img1, run_encoder = True)
+            intrinsic2, extrinsic2 = model(img2, run_encoder = True)
+            relight_img2 = model([intrinsic1, extrinsic2], run_encoder = False).clamp(-1,1)
     
-    for i, (img1, img2, img3) in enumerate(tqdm.tqdm(train_loader)):
-        img1 = img1.to(args.gpu)  # Input image
-        img2 = img2.to(args.gpu)  # Reference image (different lighting)
-        img3 = img3.to(args.gpu)  # Ground truth (target lighting)
+            shift = (relight_img2 - img2).mean(dim = [2,3], keepdim = True)
+            correct_relight_img2 = relight_img2 - shift
 
-        rnd_normal = torch.randn([img1.shape[0], 1, 1, 1], device=img1.device)
-        sigma = (rnd_normal * P_std + P_mean).exp().to(img1.device) * 0 + 0.001
-        noise = torch.randn_like(img1)
-        noisy_img1 = img1 + noise * sigma
-        noisy_img2 = img2 + noise * sigma
+            # Compute metrics
+            ssim_score = ssim_metric(relight_img2, img3)
+            psnr_score = psnr_metric(relight_img2, img3)
+            lpips_score = lpips_metric(relight_img2, img3)
+            delta_e_score = delta_e_metric(relight_img2, img3)
+            """
+            #identitat
+            ssim_score = ssim_metric(img1, img3)
+            psnr_score = psnr_metric(img1, img3)
+            lpips_score = lpips_metric(img1, img3)
+            delta_e_score = delta_e_metric(img1, img3)
+            """
 
-        intrinsic1, extrinsic1 = model(img1, run_encoder = True)
-        intrinsic2, extrinsic2 = model(img2, run_encoder = True)
-        relight_img2 = model([intrinsic1, extrinsic2], run_encoder = False).clamp(-1,1)
-  
-        shift = (relight_img2 - img2).mean(dim = [2,3], keepdim = True)
-        correct_relight_img2 = relight_img2 - shift
+            # Accumulate scores
+            ssim_scores.append(ssim_score.item())
+            psnr_scores.append(psnr_score.item())
+            lpips_scores.append(lpips_score.item())
+            delta_e_scores.append(delta_e_score)
 
-        # Compute metrics
-        ssim_score = ssim_metric(relight_img2, img3)
-        psnr_score = psnr_metric(relight_img2, img3)
-        lpips_score = lpips_metric(relight_img2, img3)
-        delta_e_score = delta_e_metric(relight_img2, img3)
-                
-        # Accumulate scores
-        ssim_scores.append(ssim_score.item())
-        psnr_scores.append(psnr_score.item())
-        lpips_scores.append(lpips_score.item())
-        delta_e_scores.append(delta_e_score)
+            # Prepare images for wandb logging (convert from [-1, 1] to [0, 1])
+            def normalize_for_display(img_tensor):
+                return (img_tensor + 1.0) / 2.0
+            
+            #print(f"Batch {i} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}")
+            batch_size = img1.shape[0]
+            for j in range(min(batch_size, 4)):  # Max 4 images per batch
+                # Create a grid of images: [Input, Reference, Relit, Ground Truth]
+                input_img = normalize_for_display(img1[j]).cpu()
+                ref_img = normalize_for_display(img2[j]).cpu()
+                relit_img = normalize_for_display(relight_img2[j]).cpu()
+                gt_img = normalize_for_display(img3[j]).cpu()
+                    
+                # Create a horizontal grid
+                grid_img = torch.cat([input_img, ref_img, relit_img, gt_img], dim=2)
+                    
+                if i==0 or i%10 == 0:
+                    wandb_images.append(wandb.Image(
+                            grid_img,
+                            caption=f"Batch {i}, Sample {j} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}"
+                        ))
+                    
+                # Store metrics for table
+                all_metrics.append({
+                        "batch_idx": i,
+                        "sample_idx": j,
+                        "ssim": ssim_score.item(),
+                        "psnr": psnr_score.item(),
+                        "lpips": lpips_score.item(),
+                        "delta_e": delta_e_score,
+                        "input_reference_relit_gt": wandb.Image(grid_img, caption="Input | Reference | Relit | Ground Truth")
+                    })
+                wandb.log({
+                    "eval/ssim": ssim_score,
+                    "eval/psnr": psnr_score,
+                    "eval/lpips": lpips_score,
+                    "eval/delta_e": delta_e_score,
+                    "eval/num_samples": len(val_loader),
+                    "eval/step": i
+                    })
 
-        # Prepare images for wandb logging (convert from [-1, 1] to [0, 1])
-        def normalize_for_display(img_tensor):
-            return (img_tensor + 1.0) / 2.0
+        # Calculate average metrics
+        avg_ssim = np.mean(ssim_scores)
+        avg_psnr = np.mean(psnr_scores)
+        avg_lpips = np.mean(lpips_scores)
+        avg_delta_e = np.mean(delta_e_scores)
+
+        print(f"  SSIM: {avg_ssim:.4f}")
+        print(f"  PSNR: {avg_psnr:.4f}")
+        print(f"  LPIPS: {avg_lpips:.4f}")
+        print(f"  Delta E: {avg_delta_e:.4f}")
+        print(f"  Samples: {len(val_loader)}")
         
-        #print(f"Batch {i} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}")
-        batch_size = img1.shape[0]
-        for j in range(min(batch_size, 4)):  # Max 4 images per batch
-            # Create a grid of images: [Input, Reference, Relit, Ground Truth]
-            input_img = normalize_for_display(img1[j]).cpu()
-            ref_img = normalize_for_display(img2[j]).cpu()
-            relit_img = normalize_for_display(correct_relight_img2[j]).cpu()
-            gt_img = normalize_for_display(img3[j]).cpu()
-                
-            # Create a horizontal grid
-            grid_img = torch.cat([input_img, ref_img, relit_img, gt_img], dim=2)
-                
-            wandb_images.append(wandb.Image(
-                    grid_img,
-                    caption=f"Batch {i}, Sample {j} | SSIM: {ssim_score.item():.3f}, PSNR: {psnr_score.item():.2f}, LPIPS: {lpips_score.item():.3f}, ΔE: {delta_e_score:.3f}"
-                ))
-                
-            # Store metrics for table
-            all_metrics.append({
-                    "batch_idx": i,
-                    "sample_idx": j,
-                    "ssim": ssim_score.item(),
-                    "psnr": psnr_score.item(),
-                    "lpips": lpips_score.item(),
-                    "delta_e": delta_e_score,
-                    "input_reference_relit_gt": wandb.Image(grid_img, caption="Input | Reference | Relit | Ground Truth")
-                })
-
-    # Calculate average metrics
-    avg_ssim = np.mean(ssim_scores)
-    avg_psnr = np.mean(psnr_scores)
-    avg_lpips = np.mean(lpips_scores)
-    avg_delta_e = np.mean(delta_e_scores)
-
-    print(f"  SSIM: {avg_ssim:.4f}")
-    print(f"  PSNR: {avg_psnr:.4f}")
-    print(f"  LPIPS: {avg_lpips:.4f}")
-    print(f"  Delta E: {avg_delta_e:.4f}")
-    print(f"  Samples: {len(train_loader)}")
-    
-    wandb.log({
-            "eval/avg_ssim": avg_ssim,
-            "eval/avg_psnr": avg_psnr,
-            "eval/avg_lpips": avg_lpips,
-            "eval/avg_delta_e": avg_delta_e,
-            "eval/num_samples": len(train_loader),
-            "eval/epoch": epoch
-        })
+        wandb.log({
+                "eval/avg_ssim": avg_ssim,
+                "eval/avg_psnr": avg_psnr,
+                "eval/avg_lpips": avg_lpips,
+                "eval/avg_delta_e": avg_delta_e,
+                "eval/num_samples": len(val_loader),
+                "eval/epoch": epoch
+            })
         
-    # Log image grids
-    wandb.log({
-            "eval/relight_results": wandb_images
-        })
-        
-    """# Create and log detailed results table
-    table = wandb.Table(columns=["batch_idx", "sample_idx", "ssim", "psnr", "lpips", "delta_e", "images"])
-    for metric_row in all_metrics:
-            table.add_data(
-                metric_row["batch_idx"],
-                metric_row["sample_idx"],
-                metric_row["ssim"],
-                metric_row["psnr"],
-                metric_row["lpips"],
-                metric_row["delta_e"],
-                metric_row["input_reference_relit_gt"]
-            )
-        
-    wandb.log({"eval/detailed_results": table})"""
-        
-    # Log metric distributions
-    wandb.log({
-            "eval/ssim_distribution": wandb.Histogram(ssim_scores),
-            "eval/psnr_distribution": wandb.Histogram(psnr_scores),
-            "eval/lpips_distribution": wandb.Histogram(lpips_scores),
-            "eval/delta_e_distribution": wandb.Histogram(delta_e_scores)
-        })
+        # Log image grids
+        wandb.log({
+                "eval/relight_results": wandb_images
+            })
+            
+        # Create and log detailed results table
+        table = wandb.Table(columns=["batch_idx", "sample_idx", "ssim", "psnr", "lpips", "delta_e", "images"])
+        for metric_row in all_metrics:
+                table.add_data(
+                    metric_row["batch_idx"],
+                    metric_row["sample_idx"],
+                    metric_row["ssim"],
+                    metric_row["psnr"],
+                    metric_row["lpips"],
+                    metric_row["delta_e"],
+                    metric_row["input_reference_relit_gt"]
+                )
+            
+        wandb.log({"eval/detailed_results": table})
+            
+        """# Log metric distributions
+        wandb.log({
+                "eval/ssim_distribution": wandb.Histogram(ssim_scores),
+                "eval/psnr_distribution": wandb.Histogram(psnr_scores),
+                "eval/lpips_distribution": wandb.Histogram(lpips_scores),
+                "eval/delta_e_distribution": wandb.Histogram(delta_e_scores)
+            })"""
         
     return
 
