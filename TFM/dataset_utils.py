@@ -36,29 +36,35 @@ class RSRDataset(Dataset):
         if scenes is not None:
             # Use explicitly provided scenes
             self.scenes = [s for s in scenes if s in all_scenes]
-        else:
-            # Auto-split: use all scenes except 2 for training, 2 for validation
-            if len(all_scenes) < 2:
-                raise ValueError(f"Need at least 2 scenes for auto-split, found {len(all_scenes)}")
-            
-            # Determine validation scenes
-            if validation_scenes is not None:
-                val_scenes = [s for s in validation_scenes if s in all_scenes]
-                if len(val_scenes) < 2:
-                    # Fallback to last 2 scenes if provided validation_scenes are invalid
-                    val_scenes = all_scenes[-2:]
-                    print(f"Warning: Using last 2 scenes for validation: {val_scenes}")
-            else:
-                # Use last 2 scenes for validation by default
-                val_scenes = all_scenes[-2:]
-            
+
+        # Determine validation scenes
+        elif validation_scenes is not None:
+            print(f"Using provided validation scenes: {validation_scenes}")
+            val_scenes = [s for s in validation_scenes if s in all_scenes]
             if self.is_validation:
-                self.scenes = val_scenes
-                # Store all scenes for cross-scene reference selection
-                self.all_available_scenes = all_scenes
+                    self.scenes = val_scenes
+                    # Store all scenes for cross-scene reference selection
+                    self.all_available_scenes = val_scenes
             else:
                 # Training: use all scenes except validation scenes
                 self.scenes = [s for s in all_scenes if s not in val_scenes]
+        else:
+            print("No specific scenes provided, auto-splitting dataset")
+            # Auto-split: use all scenes except 2 for training, 2 for validation
+            if len(all_scenes) < 2:
+                raise ValueError(f"Need at least 2 scenes for auto-split, found {len(all_scenes)}")
+
+            else:
+                # Use last 2 scenes for validation by default
+                val_scenes = all_scenes[-2:]
+                if self.is_validation:
+                    self.scenes = val_scenes
+                    # Store all scenes for cross-scene reference selection
+                    self.all_available_scenes = val_scenes
+                else:
+                    # Training: use all scenes except validation scenes
+                    self.scenes = [s for s in all_scenes if s not in val_scenes]
+            
                 
         if not self.scenes:
             raise ValueError(f"No valid scenes found in {root_dir}")
@@ -160,6 +166,7 @@ class RSRDataset(Dataset):
                 ref_light_pos = ref_info['light_pos']
             else:
                 # Fallback: use any available reference if no cross-scene images found
+                print("Warning: No cross-scene reference images found, using any available image")
                 all_available_images = []
                 for scene_data in self.image_data.values():
                     for cam_data in scene_data.values():
@@ -222,6 +229,7 @@ class RSRDataset(Dataset):
             if ref_candidates:
                 ref_path = random.choice(ref_candidates)
             else:
+                print(f"Warning: No reference found for scene={input_scene}, camera_pos={input_camera_pos}, using input as reference")
                 # Fallback: use a random image from the same scene
                 scene_images = [img for img in self.all_images if img['scene'] == input_scene]
                 if scene_images:
