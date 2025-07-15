@@ -182,6 +182,10 @@ parser.add_argument('--normals_model_name', type=str,
                        default='GonzaloMG/marigold-e2e-ft-normals',
                        help='Hugging Face model name for normal estimation')
 
+# Normals decoder params
+parser.add_argument('--enable_normals_decoder_loss', action='store_true', help='Enable normals decoder loss')
+parser.add_argument('--normals_decoder_loss_weight', type=float, default=1.0, help='Weight for normals decoder loss')
+
 
 args = parser.parse_args()
 
@@ -204,7 +208,7 @@ def init_model(args):
     
     # Enhanced depth and normal loss
     depth_normal_loss_fn = None
-    if getattr(args, 'enable_depth_loss', False) or getattr(args, 'enable_normal_loss', False):
+    if getattr(args, 'enable_depth_loss', False) or getattr(args, 'enable_normal_loss', False) or getattr(args, 'enable_normals_decoder_loss', False):
         depth_normal_loss_fn = DepthNormalConsistencyLoss(
             depth_model_name=getattr(args, 'depth_model_name', 'depth-anything/Depth-Anything-V2-Small-hf'),
             normals_model_name=getattr(args, 'normals_model_name', 'GonzaloMG/marigold-e2e-ft-normals'),
@@ -445,9 +449,9 @@ def setup_datasets(args):
                           split='val', return_two_images=True)
     elif args.dataset == 'rsr_256':
         train_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_train, 
-                                 is_validation=False)
+                                 is_validation=False)#, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
         val_dataset = RSRDataset(root_dir=args.data_path, img_transform=transform_val, 
-                                is_validation=True)
+                                is_validation=True)#, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -494,7 +498,7 @@ import time
 
 def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, global_step, depth_normal_loss_fn, is_finetuning):
     """Train for one epoch"""
-    loss_metrics = ['loss', 'reconstruction', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss', 'normal_loss']
+    loss_metrics = ['loss', 'reconstruction', 'logdet', 'light_logdet', 'intrinsic_sim', 'depth_loss', 'normal_loss', 'normals_decoder_loss']
     meters = [AverageMeter(name, ':6.3f') for name in loss_metrics]
     progress = ProgressMeter(len(train_loader), meters, prefix=f"Epoch: [{epoch}]")
 
@@ -540,6 +544,10 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
             recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
             recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder=False).float()
             recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+            
+            # Generate normals from the new decoder (using intrinsics only)
+            normals_input = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_normals=True).float()
+            normals_ref = model(intrinsic_ref, run_encoder=False, decode_normals=True).float()
         forward_time = time.time() - forward_start_time
 
         # Loss computation timing
@@ -584,10 +592,35 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         # Combine geometric losses
         depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
         normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
+        
+        # New normals decoder loss
+        normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
+        if getattr(args, 'enable_normals_decoder_loss', False) and depth_normal_loss_fn is not None:
+            try:
+                # Extract ground truth normals from depth_normal_loss_fn
+                # We'll use the input image to get ground truth normals
+                _, _, _, _, gt_normals_input, gt_normals_ref, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+                
+                if gt_normals_input is not None:
+                    # Compute L1 loss between predicted and ground truth normals
+                    normals_decoder_loss_value = torch.nn.functional.l1_loss(normals_input, gt_normals_input)
+                    
+                    # Also add consistency loss between input and reference normals when they should be similar
+                    if gt_normals_ref is not None:
+                        # Add a small consistency loss (normals should be similar for same intrinsics)
+                        normals_consistency_loss = torch.nn.functional.l1_loss(normals_input, normals_ref)
+                        normals_decoder_loss_value += 0.1 * normals_consistency_loss
+                        
+            except Exception as e:
+                print(f"Warning: Normals decoder loss computation failed: {e}")
+                normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
+        
+        normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_decoder_loss_value
        
         # Total loss
         total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
-                     depth_loss_component + normal_loss_component + logdet_ext_reg_loss)
+                     depth_loss_component + normal_loss_component + logdet_ext_reg_loss +
+                     normals_decoder_loss_component)
         loss_time = time.time() - loss_start_time
 
         # Backward pass timing
@@ -613,6 +646,7 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
                 'logdet_ext_loss': logdet_ext_reg_loss.item(),
                 'depth_loss': depth_loss_component.item(),
                 'normal_loss': normal_loss_component.item(),
+                'normals_decoder_loss': normals_decoder_loss_component.item(),
                 'learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'is_finetuning': is_finetuning,
@@ -633,6 +667,7 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         meters[4].update(intrinsic_loss_component.item())
         meters[5].update(depth_loss_component.item())
         meters[6].update(normal_loss_component.item())
+        meters[7].update(normals_decoder_loss_component.item())
         
         if i % 50 == 0:
             progress.display(i)

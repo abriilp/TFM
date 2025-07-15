@@ -33,20 +33,22 @@ python -m torch.distributed.launch \
 --reg_weight 1e-4 \
 --intrinsics_loss_weight 1e-1 \
 --epochs 50 \
---batch_size 2 \
+--batch_size 1 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
---wandb_project "Latent_Intrinsics_Relighting" \
---wandb_run_name "AMB logdet_ext SENSE depth loss recon totes" \
+--wandb_project "intrinsic relighting2" \
+--wandb_run_name "proves_normals_decoder" \
 --dataset rsr_256 \
---experiment_name "ft_rsr_nle_ndl_recon4" \
---resume_from /home/apinyol/TFM/Models/Latent_Intrinsics/last.pth.tar \
-
+--experiment_name "proves_normals_decoder" \
+--resume_from /home/apinyol/TFM/Models/last.pth.tar \
+--enable_normal_loss \
 #--enable_normal_loss \
-#--normal_loss_weight 10.0 \
+#--enable_depth_loss
 
+#--normal_loss_weight 1e-1 \
 #--enable_depth_loss \
-#--depth_loss_weight 10.0 \
+
+
 
 # Start new experiment
 #--experiment_name "depth_ablation" --learning_rate 0.001
@@ -64,7 +66,7 @@ python -m torch.distributed.launch \
 
 # Depth params
 # --enable_depth_loss \
-# --depth_loss_weight 1e-2 \
+# --depth_loss_weight 1e-2 \ 1e-1
 # --depth_model_name "depth-anything/Depth-Anything-V2-Small-hf
  
  #wandb projecs: 

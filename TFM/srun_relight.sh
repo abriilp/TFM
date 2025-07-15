@@ -27,5 +27,7 @@ data_path=/home/apinyol/TFM/Data/RSR_256
 python -m torch.distributed.launch \
 --nproc_per_node=1 --master_port=${port} main_relight.py \
 --data_path ${data_path} \
---load_ckpt /home/apinyol/TFM/Latent_Intrinsics/TFM/checkpoints/normal_loss_bo_20250709_182906_cf12c53a/latest.pth \
+--load_ckpt /home/apinyol/TFM/Latent_Intrinsics/TFM/checkpoints/depth_loss_bo_20250710_095231_8bcb7fa9/latest.pth \
+--datasets mit \
+--batch_size 1 \
 

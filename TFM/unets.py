@@ -269,6 +269,7 @@ class UNet(torch.nn.Module):
             for idx in range(num_blocks_list[level]):
                 cin = cout
                 cout = model_channels * mult
+                cout2 = cout
                 attn = (res in attn_resolutions)
                 if idx == num_blocks_list[level] - 1 and res in [128, 64, 32, 16, 8]:
                     self.enc[f'{res}x{res}_block{idx}_final'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
@@ -288,6 +289,7 @@ class UNet(torch.nn.Module):
         for level, (mult, num_blocks) in reversed(list(enumerate(zip(channel_mult, num_blocks_list)))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
+                print(f"Decoder in_channels: {cout}, out_channels: {cout}")
                 self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
                 self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
@@ -302,6 +304,27 @@ class UNet(torch.nn.Module):
                 attn = (idx == num_blocks and res in attn_resolutions)
                 self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
         self.final = nn.Sequential(GroupNorm(num_channels=cout, eps=1e-6), nn.SiLU(), Conv2d(in_channels=cout, out_channels=out_channels, kernel=3))
+        # Normals decoder.
+        self.normals_dec = torch.nn.ModuleDict()
+        for level, (mult, num_blocks) in reversed(list(enumerate(zip(channel_mult, num_blocks_list)))):
+            res = img_resolution >> level
+            if level == len(channel_mult) - 1:
+                print(f"Normals Decoder in_channels: {cout2}, out_channels: {cout2}")
+                self.normals_dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout2, out_channels=cout2, attention=True, **block_kwargs)
+                self.normals_dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout2, out_channels=cout2, **block_kwargs)
+            else:
+                self.normals_dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout2, out_channels=cout2, up=True, **block_kwargs)
+            if len(skips) > 0:
+                skip = skips.pop()
+            else:
+                skip = 0
+            for idx in range(num_blocks + 1):
+                cin = cout2 + skip
+                cout2 = model_channels * mult
+                attn = (idx == num_blocks and res in attn_resolutions)
+                self.normals_dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout2, attention=attn, **block_kwargs)
+        self.normals_final = nn.Sequential(GroupNorm(num_channels=cout2, eps=1e-6), nn.SiLU(), Conv2d(in_channels=cout2, out_channels=3, kernel=3))  # 3 channels for normals
+
 
     def update_affine_scale(self, affine_scale):
         for layer in self.enc.values():
@@ -312,7 +335,7 @@ class UNet(torch.nn.Module):
             if isinstance(layer, UNetBlock):
                 layer.affine_scale = affine_scale
 
-    def forward(self, input, run_encoder):
+    def forward(self, input, run_encoder, decode_normals=False):
         if run_encoder:
             # Encoder.
             skips = []
@@ -326,12 +349,30 @@ class UNet(torch.nn.Module):
                     skips.append(F.normalize(x, dim = 1))
             light_code = F.normalize(self.light_encoder(x.mean(dim = [2,3])), dim = -1)
             return skips, light_code
+        if decode_normals:
+            skips = input
+            x = self.pos_embed.expand(skips[-1].shape[0], -1, -1, -1)
+            
+            for name, block in self.normals_dec.items():
+                
+                if ('in1' in name or 'up' in name) and len(skips) > 0:
+                    skip = skips.pop()
+                    skip = skip * np.sqrt(skip.shape[1])
+                if x.shape[1] != block.in_channels:
+                    skip = skips.pop()
+                    skip = skip * np.sqrt(skip.shape[1])
+                    x = torch.cat([x, skip], dim=1)
+                x = block(x, emb=None)  # No light embedding
+            return self.normals_final(x)
         else:
             skips, light_code = input
+            #print(f'Skips len: {len(skips)}, Light code shape: {light_code.shape}, Skips shape [0]: {skips[0].shape}, Skips shape [1]: {skips[1].shape}, Skips shape [2]: {skips[2].shape}, Skips shape [3]: {skips[3].shape}, Skips shape [4]: {skips[4].shape}')
             light_emb = self.light_decoder(light_code * np.sqrt(light_code.shape[-1]))
             # Decoder.
             x = self.pos_embed.expand(light_code.shape[0],-1,-1,-1)
+
             for name, block in self.dec.items():
+                
                 if ('in1' in name or 'up' in name) and len(skips) > 0:
                     skip = skips.pop()
                     skip = skip * np.sqrt(skip.shape[1])
