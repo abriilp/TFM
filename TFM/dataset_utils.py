@@ -36,34 +36,29 @@ class RSRDataset(Dataset):
         if scenes is not None:
             # Use explicitly provided scenes
             self.scenes = [s for s in scenes if s in all_scenes]
-
-        # Determine validation scenes
-        elif validation_scenes is not None:
-            print(f"Using provided validation scenes: {validation_scenes}")
-            val_scenes = [s for s in validation_scenes if s in all_scenes]
-            if self.is_validation:
-                    self.scenes = val_scenes
-                    # Store all scenes for cross-scene reference selection
-                    self.all_available_scenes = val_scenes
-            else:
-                # Training: use all scenes except validation scenes
-                self.scenes = [s for s in all_scenes if s not in val_scenes]
         else:
-            print("No specific scenes provided, auto-splitting dataset")
             # Auto-split: use all scenes except 2 for training, 2 for validation
             if len(all_scenes) < 2:
                 raise ValueError(f"Need at least 2 scenes for auto-split, found {len(all_scenes)}")
-
+            
+            # Determine validation scenes
+            if validation_scenes is not None:
+                val_scenes = [s for s in validation_scenes if s in all_scenes]
+                if len(val_scenes) < 2:
+                    # Fallback to last 2 scenes if provided validation_scenes are invalid
+                    val_scenes = all_scenes[-2:]
+                    print(f"Warning: Using last 2 scenes for validation: {val_scenes}")
             else:
                 # Use last 2 scenes for validation by default
                 val_scenes = all_scenes[-2:]
-                if self.is_validation:
-                    self.scenes = val_scenes
-                    # Store all scenes for cross-scene reference selection
-                    self.all_available_scenes = val_scenes
-                else:
-                    # Training: use all scenes except validation scenes
-                    self.scenes = [s for s in all_scenes if s not in val_scenes]
+            
+            if self.is_validation:
+                self.scenes = val_scenes
+                # Store all scenes for cross-scene reference selection
+                self.all_available_scenes = all_scenes
+            else:
+                # Training: use all scenes except validation scenes
+                self.scenes = [s for s in all_scenes if s not in val_scenes]
             
                 
         if not self.scenes:
@@ -252,3 +247,311 @@ class RSRDataset(Dataset):
                 input_img, ref_img = self.group_img_transform([input_img, ref_img])
             
             return input_img, ref_img
+
+
+class RLSIDDataset(Dataset):
+    def __init__(self, root_dir, img_transform=None, mode='train', annotation_file=None, 
+                 use_reflectance=False, use_shading=False, cross_scene_validation=False):
+        """
+        ReLighting Surreal Intrinsic Dataset (RLSID) for relighting tasks
+        
+        Args:
+            root_dir: Path to the dataset root directory containing Image, Reflectance, Shading folders
+            img_transform: List of image transformations [group_transform, single_transform] or single transform
+            mode: 'train', 'val', 'test_quantitative', 'test_qualitative', or 'custom'
+            annotation_file: Path to annotation file (train.txt, val_pairs.txt, etc.)
+                           If None, will try to auto-detect based on mode
+            use_reflectance: If True, also loads reflectance components
+            use_shading: If True, also loads shading components
+            cross_scene_validation: If True, ensures reference images come from different scenes (validation mode)
+        """
+        self.root_dir = root_dir
+        self.mode = mode
+        self.use_reflectance = use_reflectance
+        self.use_shading = use_shading
+        self.cross_scene_validation = cross_scene_validation
+        
+        # Handle transform assignment
+        if img_transform is not None and isinstance(img_transform, list):
+            self.group_img_transform = img_transform[0]
+            self.single_img_transform = img_transform[1]
+        else:
+            self.group_img_transform = None
+            self.single_img_transform = img_transform
+        
+        # Set up folder paths
+        self.image_dir = os.path.join(root_dir, 'Image')
+        self.reflectance_dir = os.path.join(root_dir, 'Reflectance') if use_reflectance else None
+        self.shading_dir = os.path.join(root_dir, 'Shading') if use_shading else None
+        self.annotation_dir = os.path.join(root_dir, 'annotation')
+        
+        # Verify directories exist
+        if not os.path.exists(self.image_dir):
+            raise ValueError(f"Image directory not found: {self.image_dir}")
+        
+        if use_reflectance and not os.path.exists(self.reflectance_dir):
+            raise ValueError(f"Reflectance directory not found: {self.reflectance_dir}")
+        
+        if use_shading and not os.path.exists(self.shading_dir):
+            raise ValueError(f"Shading directory not found: {self.shading_dir}")
+        
+        # Load data based on mode
+        if mode in ['train', 'val', 'test_quantitative', 'test_qualitative']:
+            self.data_pairs = self._load_annotation_file(annotation_file)
+        elif mode == 'custom':
+            # Custom mode: load all images and create pairs dynamically
+            self.data_pairs = self._create_custom_pairs()
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        
+        if not self.data_pairs:
+            raise ValueError(f"No valid data pairs found for mode: {mode}")
+        
+        print(f"Loaded {len(self.data_pairs)} pairs for mode: {mode}")
+        
+    def _load_annotation_file(self, annotation_file):
+        """Load data pairs from annotation file"""
+        if annotation_file is None:
+            # Auto-detect annotation file based on mode
+            filename_map = {
+                'train': 'train.txt',
+                'val': 'val_pairs.txt',
+                'test_quantitative': 'test_quantitative_pairs.txt',
+                'test_qualitative': 'test_qualitative_pairs.txt'
+            }
+            if self.mode not in filename_map:
+                raise ValueError(f"No default annotation file for mode: {self.mode}")
+            annotation_file = os.path.join(self.annotation_dir, filename_map[self.mode])
+        
+        if not os.path.exists(annotation_file):
+            raise ValueError(f"Annotation file not found: {annotation_file}")
+        
+        pairs = []
+        with open(annotation_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Parse different annotation formats
+                if self.mode == 'train':
+                    # Training set might just list image names
+                    pairs.append({'input': line.strip()})
+                else:
+                    # Validation/test sets should have pairs
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pairs.append({
+                            'input': parts[0].strip(),
+                            'reference': parts[1].strip()
+                        })
+                    else:
+                        # Fallback: treat as single image
+                        pairs.append({'input': parts[0].strip()})
+        
+        return pairs
+    
+    def _create_custom_pairs(self):
+        """Create custom pairs by scanning all images"""
+        image_files = glob.glob(os.path.join(self.image_dir, "*.png"))
+        
+        # Parse all images and organize by scene
+        scene_data = {}  # scene_id -> {background_id -> [image_info]}
+        
+        for img_path in image_files:
+            try:
+                filename = os.path.basename(img_path)
+                # Parse filename: aaa_bbb_xxx_yyy_zzz.png
+                parts = filename.split('_')
+                if len(parts) >= 5:
+                    scene_id = parts[0]
+                    background_id = parts[1]
+                    pan = parts[2]
+                    tilt = parts[3]
+                    color = parts[4].split('.')[0]  # Remove .png extension
+                    
+                    scene_key = f"{scene_id}_{background_id}"
+                    
+                    if scene_key not in scene_data:
+                        scene_data[scene_key] = []
+                    
+                    scene_data[scene_key].append({
+                        'filename': filename,
+                        'path': img_path,
+                        'scene_id': scene_id,
+                        'background_id': background_id,
+                        'pan': pan,
+                        'tilt': tilt,
+                        'color': color,
+                        'scene_key': scene_key
+                    })
+            except (IndexError, ValueError) as e:
+                print(f"Skipping invalid filename: {filename} - {e}")
+                continue
+        
+        # Create pairs
+        pairs = []
+        for scene_key, images in scene_data.items():
+            for img_info in images:
+                pairs.append({'input': img_info['filename'], 'scene_data': scene_data})
+        
+        return pairs
+    
+    def _parse_filename(self, filename):
+        """Parse RLSID filename format: aaa_bbb_xxx_yyy_zzz.png"""
+        parts = filename.split('_')
+        if len(parts) < 5:
+            raise ValueError(f"Invalid filename format: {filename}")
+        
+        return {
+            'scene_id': parts[0],
+            'background_id': parts[1],
+            'pan': parts[2],
+            'tilt': parts[3],
+            'color': parts[4].split('.')[0],
+            'scene_key': f"{parts[0]}_{parts[1]}"
+        }
+    
+    def _get_image_path(self, filename, image_type='Image'):
+        """Get full path for an image file"""
+        if image_type == 'Image':
+            return os.path.join(self.image_dir, filename)
+        elif image_type == 'Reflectance':
+            return os.path.join(self.reflectance_dir, filename)
+        elif image_type == 'Shading':
+            return os.path.join(self.shading_dir, filename)
+        else:
+            raise ValueError(f"Unknown image type: {image_type}")
+    
+    def _find_reference_image(self, input_filename, input_info):
+        """Find appropriate reference image based on mode and settings"""
+        if self.mode == 'train' or (self.mode == 'custom' and not self.cross_scene_validation):
+            # Training mode: same scene, different lighting
+            if 'scene_data' in self.data_pairs[0]:
+                scene_data = self.data_pairs[0]['scene_data']
+                scene_key = input_info['scene_key']
+                
+                if scene_key in scene_data:
+                    # Find images with different lighting conditions
+                    candidates = [img for img in scene_data[scene_key] 
+                                if img['color'] != input_info['color']]
+                    
+                    if candidates:
+                        return random.choice(candidates)['filename']
+            
+            # Fallback: use input as reference
+            return input_filename
+        
+        elif self.cross_scene_validation:
+            # Cross-scene validation: different scene
+            if 'scene_data' in self.data_pairs[0]:
+                scene_data = self.data_pairs[0]['scene_data']
+                input_scene_key = input_info['scene_key']
+                
+                # Find images from different scenes
+                candidates = []
+                for scene_key, images in scene_data.items():
+                    if scene_key != input_scene_key:
+                        candidates.extend([img['filename'] for img in images])
+                
+                if candidates:
+                    return random.choice(candidates)
+            
+            # Fallback: use input as reference
+            return input_filename
+        
+        else:
+            # Default: use input as reference
+            return input_filename
+    
+    def __len__(self):
+        return len(self.data_pairs)
+    
+    def __getitem__(self, idx):
+        pair = self.data_pairs[idx]
+        input_filename = pair['input']
+        
+        # Parse input filename
+        input_info = self._parse_filename(input_filename)
+        
+        # Get reference filename
+        if 'reference' in pair:
+            ref_filename = pair['reference']
+        else:
+            ref_filename = self._find_reference_image(input_filename, input_info)
+        
+        # Load input image
+        input_path = self._get_image_path(input_filename, 'Image')
+        input_img = Image.open(input_path).convert('RGB')
+        
+        # Load reference image
+        ref_path = self._get_image_path(ref_filename, 'Image')
+        ref_img = Image.open(ref_path).convert('RGB')
+        
+        # Prepare return data
+        return_data = [input_img, ref_img]
+        
+        # Load reflectance components if requested
+        if self.use_reflectance:
+            input_refl_path = self._get_image_path(input_filename, 'Reflectance')
+            ref_refl_path = self._get_image_path(ref_filename, 'Reflectance')
+            
+            input_refl = Image.open(input_refl_path).convert('RGB')
+            ref_refl = Image.open(ref_refl_path).convert('RGB')
+            
+            return_data.extend([input_refl, ref_refl])
+        
+        # Load shading components if requested
+        if self.use_shading:
+            input_shad_path = self._get_image_path(input_filename, 'Shading')
+            ref_shad_path = self._get_image_path(ref_filename, 'Shading')
+            
+            input_shad = Image.open(input_shad_path).convert('RGB')
+            ref_shad = Image.open(ref_shad_path).convert('RGB')
+            
+            return_data.extend([input_shad, ref_shad])
+        
+        # Apply single image transforms
+        if self.single_img_transform is not None:
+            return_data = [self.single_img_transform(img) for img in return_data]
+        
+        # Apply group transforms
+        if self.group_img_transform is not None:
+            return_data = self.group_img_transform(return_data)
+        
+        return tuple(return_data)
+
+
+# Example usage:
+"""
+# Basic usage with training data
+train_dataset = RLSIDDataset(
+    root_dir='./data',
+    mode='train',
+    img_transform=[group_transform, single_transform]
+)
+
+# Validation with cross-scene references
+val_dataset = RLSIDDataset(
+    root_dir='./data',
+    mode='val',
+    cross_scene_validation=True,
+    img_transform=[group_transform, single_transform]
+)
+
+# Custom mode with reflectance and shading
+custom_dataset = RLSIDDataset(
+    root_dir='./data',
+    mode='custom',
+    use_reflectance=True,
+    use_shading=True,
+    img_transform=[group_transform, single_transform]
+)
+
+# Test with specific annotation file
+test_dataset = RLSIDDataset(
+    root_dir='./data',
+    mode='test_quantitative',
+    annotation_file='./data/annotation/test_quantitative_pairs.txt'
+)
+"""

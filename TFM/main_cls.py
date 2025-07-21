@@ -194,8 +194,8 @@ def init_model(args):
     model = UNet(img_resolution=256, in_channels=3, out_channels=3,
                  num_blocks_list=[1, 2, 2, 4, 4, 4], attn_resolutions=[0], model_channels=32,
                  channel_mult=[1, 2, 4, 4, 8, 16], affine_scale=float(args.affine_scale))
-    if args.is_master:
-        wandb.watch(model, log='all', log_freq=100)
+    """if args.is_master:
+        wandb.watch(model, log='all', log_freq=100)"""
     model.cuda(args.gpu)
     ema_model = copy.deepcopy(model)
     ema_model.cuda(args.gpu)
@@ -214,7 +214,10 @@ def init_model(args):
             normals_model_name=getattr(args, 'normals_model_name', 'GonzaloMG/marigold-e2e-ft-normals'),
             device=args.gpu,
             enable_depth=getattr(args, 'enable_depth_loss', False),
-            enable_normals=getattr(args, 'enable_normal_loss', False)
+            enable_normals=(
+            getattr(args, 'enable_normal_loss', False) or 
+            getattr(args, 'enable_normals_decoder_loss', False)
+        )
         )
 
     return model, ema_model, optimizer, depth_normal_loss_fn
@@ -389,7 +392,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                   epoch, args, global_step, depth_normal_loss_fn, is_finetuning)
         
         # Validation every "x" epochs
-        if epoch % 3 == 0 or epoch == 0:
+        if epoch % 1 == 0 or epoch == 0:
             print(f"Running validation at epoch {epoch}")
             validate_multi_datasets(validation_loaders, model, epoch, args, global_step, depth_normal_loss_fn=depth_normal_loss_fn)
         
@@ -514,7 +517,7 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
     ssim_loss = compute_SSIM_loss()
 
     for i, (input_img, ref_img) in enumerate(train_loader):
-        """if i>=5:
+        """if i>=2:
             break  # Limit to first 5 batches for debugging"""
         current_step = global_step + i
         
@@ -540,15 +543,28 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
             intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder=True)
 
             # Reconstruct images
-            recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder=False).float()
-            recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
-            recon_img_ri = model([intrinsic_ref, extrinsic_input], run_encoder=False).float()
-            recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+            recon_img_rr, normals_ref = model([intrinsic_ref, extrinsic_ref], run_encoder=False, decode_mode='both')
+            recon_img_ir, normals_input = model([intrinsic_input, extrinsic_ref], run_encoder=False, decode_mode='both')
+            recon_img_ri, _ = model([intrinsic_ref, extrinsic_input], run_encoder=False, decode_mode='both')
+            recon_img_ii, _ = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_mode='both')
             
+            recon_img_rr, recon_img_ir, recon_img_ri, recon_img_ii, normals_input, normals_ref= recon_img_ii.float(), recon_img_ir.float(), recon_img_ri.float(), recon_img_ii.float(), normals_input.float(), normals_ref.float()
             # Generate normals from the new decoder (using intrinsics only)
-            normals_input = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_normals=True).float()
-            normals_ref = model(intrinsic_ref, run_encoder=False, decode_normals=True).float()
+            #normals_input = model(intrinsic_input, run_encoder=False, decode_mode='normal').float()
+            #normals_ref = model(intrinsic_ref, run_encoder=False, decode_mode='normal').float()
         forward_time = time.time() - forward_start_time
+        if i < 5 and args.is_master and not args.disable_wandb:
+            try:
+                # Standard relighting visualization
+                log_relighting_results(
+                    input_img=input_img,
+                    ref_img=ref_img,
+                    relit_img=recon_img_ir,
+                    gt_img=ref_img,
+                    step=current_step,
+                    )
+            except:
+                print("Warning: Failed to log relighting results, skipping visualization in training loop")
 
         # Loss computation timing
         loss_start_time = time.time()
@@ -593,23 +609,25 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
         normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
         
-        # New normals decoder loss
+        # normals decoder loss
         normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
         if getattr(args, 'enable_normals_decoder_loss', False) and depth_normal_loss_fn is not None:
             try:
                 # Extract ground truth normals from depth_normal_loss_fn
                 # We'll use the input image to get ground truth normals
-                _, _, _, _, gt_normals_input, gt_normals_ref, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+                
+                gt_normals_input = depth_normal_loss_fn.get_normal_map(input_img)
+                gt_normals_ref = depth_normal_loss_fn.get_normal_map(ref_img)
                 
                 if gt_normals_input is not None:
-                    # Compute L1 loss between predicted and ground truth normals
-                    normals_decoder_loss_value = torch.nn.functional.l1_loss(normals_input, gt_normals_input)
+                    _, _, normals_input_loss_value, _, _, _, _ = depth_normal_loss_fn(gt_normals_input, normals_input)
+                    normals_decoder_loss_value += normals_input_loss_value
                     
-                    # Also add consistency loss between input and reference normals when they should be similar
-                    if gt_normals_ref is not None:
-                        # Add a small consistency loss (normals should be similar for same intrinsics)
-                        normals_consistency_loss = torch.nn.functional.l1_loss(normals_input, normals_ref)
-                        normals_decoder_loss_value += 0.1 * normals_consistency_loss
+                # Also add consistency loss between input and reference normals when they should be similar
+                if gt_normals_ref is not None:
+                    _, _, normals_ref_loss_value , _, _, _, _ = depth_normal_loss_fn(gt_normals_ref, normals_ref)
+                    normals_decoder_loss_value += normals_ref_loss_value
+                    
                         
             except Exception as e:
                 print(f"Warning: Normals decoder loss computation failed: {e}")
@@ -620,9 +638,9 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         # Total loss
         total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
                      depth_loss_component + normal_loss_component + logdet_ext_reg_loss +
-                     normals_decoder_loss_component)
+                     normals_decoder_loss_component )
+        print(f"Total loss: {total_loss.item()} | Rec: {rec_loss_total.item()} | Logdet: {logdet_reg_loss.item()} | Intrinsic: {intrinsic_loss_component.item()} | Depth: {depth_loss_component.item()} | Normal: {normal_loss_component.item()} | Logdet Ext: {logdet_ext_reg_loss.item()} | Normals Decoder: {normals_decoder_loss_component.item()}")
         loss_time = time.time() - loss_start_time
-
         # Backward pass timing
         backward_start_time = time.time()
         scaler.scale(total_loss).backward()
@@ -710,6 +728,7 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
             total_intrinsic_loss = 0
             total_depth_loss = 0
             total_normal_loss = 0
+            total_normals_decoder_loss = 0
             num_batches = 0
 
             total_val_batches = len(val_loader)
@@ -734,9 +753,12 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
                 
                 # Reconstruct images
-                recon_img_rr = model([intrinsic_ref, extrinsic_ref], run_encoder=False).float()
-                recon_img_ir = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
-                recon_img_ii = model([intrinsic_input, extrinsic_input], run_encoder=False).float()
+                recon_img_rr, normals_ref = model([intrinsic_ref, extrinsic_ref], run_encoder=False, decode_mode='both')
+                recon_img_ir, normals_input = model([intrinsic_input, extrinsic_ref], run_encoder=False, decode_mode='both')
+                recon_img_ii, _ = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_mode='both')
+            
+                recon_img_rr, recon_img_ir, recon_img_ii, normals_input, normals_ref= recon_img_ii.float(), recon_img_ir.float(), recon_img_ii.float(), normals_input.float(), normals_ref.float()
+           
                 
                 # Compute same losses as training
                 rec_loss_total = compute_reconstruction_loss(
@@ -778,9 +800,34 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 
                 depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
                 normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
+
+                normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
+                if getattr(args, 'enable_normals_decoder_loss', False) and depth_normal_loss_fn is not None:
+                    try:
+                        # Extract ground truth normals from depth_normal_loss_fn
+                        # We'll use the input image to get ground truth normals
+                        
+                        gt_normals_input = depth_normal_loss_fn.get_normal_map(input_img)
+                        gt_normals_ref = depth_normal_loss_fn.get_normal_map(ref_img)
+                        
+                        if gt_normals_input is not None:
+                            _, _, normals_input_loss_value, _, _, _, _ = depth_normal_loss_fn(gt_normals_input, normals_input)
+                            normals_decoder_loss_value += normals_input_loss_value
+                            
+                        # Also add consistency loss between input and reference normals when they should be similar
+                        if gt_normals_ref is not None:
+                            _, _, normals_ref_loss_value , _, _, _, _ = depth_normal_loss_fn(gt_normals_ref, normals_ref)
+                            normals_decoder_loss_value += normals_ref_loss_value
+                            
+                                
+                    except Exception as e:
+                        print(f"Warning: Normals decoder loss computation failed: {e}")
+                        normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
+                
+                normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_decoder_loss_value
                 
                 batch_total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
-                                  logdet_ext_reg_loss + depth_loss_component + normal_loss_component)
+                                  logdet_ext_reg_loss + depth_loss_component + normal_loss_component + normals_decoder_loss_component)
                 
                 total_loss += batch_total_loss.item()
                 total_rec_loss += rec_loss_total.item()
@@ -789,6 +836,7 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 total_intrinsic_loss += intrinsic_loss_component.item()
                 total_depth_loss += depth_loss_component.item()
                 total_normal_loss += normal_loss_component.item()
+                total_normals_decoder_loss = normals_decoder_loss_component.item()
                 num_batches += 1
                 
                 # Log visualizations for first batch only
@@ -841,6 +889,7 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                     f'val_{dataset_name}_logdet_ext_loss': total_logdet_ext_loss / num_batches,
                     f'val_{dataset_name}_depth_loss': total_depth_loss / num_batches,
                     f'val_{dataset_name}_normal_loss': total_normal_loss / num_batches,
+                    f'val_{dataset_name}_normals_decoder_loss': total_normals_decoder_loss / num_batches,
                     f'val_epoch': epoch,
                 }
                 

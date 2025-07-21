@@ -681,7 +681,7 @@ def create_validation_datasets(args, transform_val):
             rsr_val_path = getattr(args, 'rsr_val_path', args.data_path if hasattr(args, 'data_path') else '/home/apinyol/TFM/Data/RSR_256')
             val_dataset = RSRDataset(root_dir=rsr_val_path, 
                                    img_transform=transform_val, 
-                                   is_validation=True)
+                                   is_validation=True, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
             validation_datasets['RSR_256'] = val_dataset
             
         elif dataset_name == 'iiw':
@@ -700,12 +700,54 @@ def create_validation_datasets(args, transform_val):
     return validation_datasets
 
 
+# Validation utils abril
+def create_datasets(args, transforms):
+    """Create validation datasets for multiple datasets"""
+    validation_datasets = {}
+    
+    # Get validation datasets to create (default to MIT and RSR_256)
+    val_datasets = getattr(args, 'validation_datasets', ['mit', 'rsr_256'])
+
+    # Dataset initialization
+    if args.dataset == 'mit':
+        train_dataset = MIT_Dataset_PreLoad(args.data_path, transforms[0], 
+                                           total_split=args.world_size, split_id=args.rank)
+        if 'mit' in val_datasets:
+            validation_datasets['MIT'] = MIT_Dataset('/home/apinyol/TFM/Data/multi_illumination_test_mip2_jpg', 
+                                 transforms[1], eval_mode=True)
+    elif args.dataset == 'iiw':
+        train_dataset = IIW2(root=args.data_path, img_transform=transforms[0], 
+                           split='train', return_two_images=True)
+        if 'iiw' in val_datasets:
+            validation_datasets['IIW'] = IIW2(root=args.data_path, img_transform=transforms[1], 
+                          split='val', return_two_images=True)
+    elif args.dataset == 'rsr_256':
+        train_dataset = RSRDataset(root_dir=args.data_path, img_transform=transforms[0], 
+                                 is_validation=False, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"])
+        if 'rsr_256' in val_datasets:
+            validation_datasets['RSR_256'] = RSRDataset(root_dir=args.data_path, img_transform=transforms[1], 
+                                is_validation=True, validation_scenes=["scene_01", "scene_03", "scene_05", "scene_06", "scene_07", "scene_08", "scene_10", "scene_21", "scene_22", "scene_23", "scene_24", "scene_26", "scene_27", "scene_29", "scene_30"]) 
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+    
+    # Print dataset sizes
+    for name, dataset in validation_datasets.items():
+        print(f'NUM of {name} validation images: {len(dataset)}')
+    
+    return train_dataset, validation_datasets
+
+
 def create_validation_loaders(validation_datasets, args, val_sampler):
     """Create validation data loaders for all datasets"""
     validation_loaders = {}
     val_batch_size = getattr(args, 'val_batch_size', args.batch_size)
     
     for dataset_name, dataset in validation_datasets.items():
+        """if args.distributed:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset, shuffle=False, drop_last=False)
+        else:
+            val_sampler = None"""
         val_loader = torch.utils.data.DataLoader(
             dataset, 
             batch_size=val_batch_size, 
@@ -719,94 +761,6 @@ def create_validation_loaders(validation_datasets, args, val_sampler):
         validation_loaders[dataset_name] = val_loader
     
     return validation_loaders
-
-
-def validate_multi_datasets(validation_loaders, model, epoch, args, current_step=None):
-    """Validate on multiple datasets and log results separately"""
-    from visu_utils import log_relighting_results
-    
-    model.eval()
-    all_val_metrics = {}
-    
-    # Global step counter for wandb logging
-    if current_step is None:
-        current_step = epoch * sum(len(loader) for loader in validation_loaders.values())
-
-    with torch.no_grad():
-        step_offset = 0
-        
-        for dataset_name, val_loader in validation_loaders.items():
-            print(f"Validating on {dataset_name} dataset...")
-            dataset_metrics = {}
-            
-            # Track metrics across batches
-            reconstruction_losses = []
-            input_reconstruction_losses = []
-            
-            for i, batch in enumerate(val_loader):
-                val_step = current_step + step_offset + i
-                if i >= getattr(args, 'max_val_batches', 3):  # Limit validation batches for speed
-                    break
-                
-                # Handle different batch formats
-                if len(batch) == 3:
-                    input_img, ref_img, gt_img = batch
-                else:
-                    # Fallback for 2-image case
-                    input_img, ref_img = batch
-                    gt_img = ref_img  # Use ref as gt fallback
-                    
-                input_img = input_img.to(args.gpu)
-                ref_img = ref_img.to(args.gpu)
-                gt_img = gt_img.to(args.gpu)
-                
-                # Forward pass without noise for validation
-                intrinsic_input, extrinsic_input = model(input_img, run_encoder=True)
-                intrinsic_ref, extrinsic_ref = model(ref_img, run_encoder=True)
-                
-                # Proper relighting for validation - use input intrinsics with ref extrinsics
-                relit_img = model([intrinsic_input, extrinsic_ref], run_encoder=False).float()
-                
-                # Compute validation metrics against ground truth
-                val_reconstruction_loss = nn.MSELoss()(relit_img, gt_img)
-                val_input_reconstruction = nn.MSELoss()(relit_img, input_img)  # For comparison
-                
-                reconstruction_losses.append(val_reconstruction_loss.item())
-                input_reconstruction_losses.append(val_input_reconstruction.item())
-                
-                # Log validation visualizations (only for first batch of each dataset)
-                if args.is_master and not args.disable_wandb and i == 0:
-                    log_relighting_results(
-                        input_img=input_img,
-                        ref_img=ref_img,
-                        relit_img=relit_img,
-                        gt_img=gt_img,
-                        step=val_step,
-                        mode=f'validation_{dataset_name.lower()}'
-                    )
-            
-            # Aggregate metrics for this dataset
-            if reconstruction_losses:
-                dataset_metrics = {
-                    f'val_{dataset_name.lower()}_reconstruction_loss_vs_gt': sum(reconstruction_losses) / len(reconstruction_losses),
-                    f'val_{dataset_name.lower()}_reconstruction_loss_vs_input': sum(input_reconstruction_losses) / len(input_reconstruction_losses),
-                    f'val_{dataset_name.lower()}_epoch': epoch,
-                    f'val_{dataset_name.lower()}_num_batches': len(reconstruction_losses),
-                }
-                
-                all_val_metrics[dataset_name] = dataset_metrics
-                
-                # Log to wandb with dataset-specific prefix
-                if args.is_master and not args.disable_wandb:
-                    wandb.log(dataset_metrics, step=current_step + step_offset)
-            
-            step_offset += len(val_loader)
-    
-    model.train()
-    return all_val_metrics
-
-
-
 
 
 # checkpoint management abril
@@ -909,25 +863,53 @@ def cleanup_old_checkpoints(experiment_path, keep_last=3):
 def save_checkpoint_improved(state, experiment_path, epoch, is_best=False, keep_last=3):
     """Save checkpoint with better naming and cleanup"""
     # Save epoch checkpoint
-    epoch_filename = os.path.join(experiment_path, f"epoch_{epoch:04d}.pth")
+    epoch_filename = os.path.join(experiment_path, f"epoch_{epoch:04d}.pth.tar")
     torch.save(state, epoch_filename)
     
     # Save as latest
-    latest_filename = os.path.join(experiment_path, "latest.pth")
+    latest_filename = os.path.join(experiment_path, "latest.pth.tar")
     torch.save(state, latest_filename)
     
     # Save as best if specified
     if is_best:
-        best_filename = os.path.join(experiment_path, "best.pth")
+        best_filename = os.path.join(experiment_path, "best.pth.tar")
         torch.save(state, best_filename)
     
     # Cleanup old checkpoints
     cleanup_old_checkpoints(experiment_path, keep_last)
     
-    print(f"Saved checkpoint: epoch_{epoch:04d}.pth")
+    print(f"Saved checkpoint: epoch_{epoch:04d}.pth.tar")
 
-def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scaler, args):
+def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scaler, args):#canviar device per args, i args.gpu al codi
     """Load checkpoint with error handling"""
+    if not os.path.isfile(checkpoint_path):
+        print(f"No checkpoint found at: {checkpoint_path}")
+        return 0
+
+    print(f"Loading checkpoint: {checkpoint_path}")
+
+    try:
+        if args.gpu is None:
+            checkpoint = torch.load(checkpoint_path)
+        else:
+            loc = f'cuda:{args.gpu}'
+            checkpoint = torch.load(checkpoint_path, map_location=loc)
+
+        start_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['state_dict'])
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scaler.load_state_dict(checkpoint['scaler'])
+
+        print(f"Loaded checkpoint from epoch {start_epoch}")
+        return start_epoch
+
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return 0
+    
+def load_checkpoint_improved2(checkpoint_path, model, ema_model, optimizer, scaler, args):
+    """Load checkpoint with error handling and partial loading support"""
     if not os.path.isfile(checkpoint_path):
         print(f"No checkpoint found at: {checkpoint_path}")
         return 0
@@ -942,8 +924,14 @@ def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scale
             checkpoint = torch.load(checkpoint_path, map_location=loc)
         
         start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        
+        # Load model weights with partial loading support
+        _load_model_weights_partial(model, checkpoint['state_dict'])
+        
+        # Load EMA model weights with partial loading support
+        _load_model_weights_partial(ema_model, checkpoint['ema_state_dict'])
+        
+        # Load optimizer and scaler (these should be compatible)
         optimizer.load_state_dict(checkpoint['optimizer'])
         scaler.load_state_dict(checkpoint['scaler'])
         
@@ -953,6 +941,104 @@ def load_checkpoint_improved(checkpoint_path, model, ema_model, optimizer, scale
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
         return 0
+
+
+def _load_model_weights_partial(model, state_dict):
+    """
+    Load weights into model, handling missing keys by initializing them properly.
+    This allows loading checkpoints from models with different architectures.
+    """
+    import torch.nn as nn
+    
+    # Get current model's state dict
+    model_state_dict = model.state_dict()
+    
+    # Track what gets loaded and what gets initialized
+    loaded_keys = []
+    missing_keys = []
+    unexpected_keys = []
+    
+    # Load existing weights
+    for key in model_state_dict.keys():
+        if key in state_dict:
+            # Check if shapes match
+            if model_state_dict[key].shape == state_dict[key].shape:
+                model_state_dict[key] = state_dict[key]
+                loaded_keys.append(key)
+            else:
+                print(f"Shape mismatch for {key}: model={model_state_dict[key].shape}, checkpoint={state_dict[key].shape}")
+                missing_keys.append(key)
+        else:
+            missing_keys.append(key)
+    
+    # Check for unexpected keys in checkpoint
+    for key in state_dict.keys():
+        if key not in model_state_dict:
+            unexpected_keys.append(key)
+    
+    # Initialize missing weights
+    for key in missing_keys:
+        param = model_state_dict[key]
+        _initialize_parameter(param, key)
+        print(f"Initialized missing parameter: {key} with shape {param.shape}")
+    
+    # Load the updated state dict
+    model.load_state_dict(model_state_dict)
+    
+    # Print summary
+    print(f"Loaded {len(loaded_keys)} parameters from checkpoint")
+    if missing_keys:
+        print(f"Initialized {len(missing_keys)} missing parameters")
+    if unexpected_keys:
+        print(f"Ignored {len(unexpected_keys)} unexpected keys from checkpoint")
+
+
+def _initialize_parameter(param, param_name):
+    """
+    Initialize a parameter based on its name and shape.
+    Uses appropriate initialization schemes for different layer types.
+    """
+    import torch.nn as nn
+    
+    with torch.no_grad():
+        # Determine initialization based on parameter name and shape
+        if 'weight' in param_name.lower():
+            if len(param.shape) >= 2:  # Linear/Conv layers
+                if 'norm' in param_name.lower() or 'bn' in param_name.lower():
+                    # Batch norm or layer norm weights
+                    nn.init.ones_(param)
+                elif 'embedding' in param_name.lower():
+                    # Embedding layers
+                    nn.init.normal_(param, mean=0.0, std=0.02)
+                else:
+                    # General linear/conv layers - use Xavier/Glorot uniform
+                    nn.init.xavier_uniform_(param)
+            else:
+                # 1D weight parameters (like in some attention mechanisms)
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                
+        elif 'bias' in param_name.lower():
+            # Bias parameters
+            nn.init.zeros_(param)
+            
+        elif 'norm' in param_name.lower():
+            # Normalization layer parameters
+            if len(param.shape) == 1:
+                if 'weight' in param_name.lower():
+                    nn.init.ones_(param)
+                else:
+                    nn.init.zeros_(param)
+            else:
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                
+        else:
+            # Default initialization for other parameters
+            if len(param.shape) >= 2:
+                nn.init.xavier_uniform_(param)
+            else:
+                nn.init.normal_(param, mean=0.0, std=0.02)
+    
+    print(f"  -> Used {'Xavier uniform' if len(param.shape) >= 2 and 'weight' in param_name.lower() and 'norm' not in param_name.lower() else 'Normal(0, 0.02)' if 'embedding' in param_name.lower() or len(param.shape) == 1 else 'Zeros' if 'bias' in param_name.lower() else 'Ones' if 'norm' in param_name.lower() and 'weight' in param_name.lower() else 'Default'} initialization")
     
 
 
