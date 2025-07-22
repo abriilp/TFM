@@ -294,7 +294,7 @@ class UNet(torch.nn.Module):
         self.light_decoder = nn.Sequential(nn.Linear(16, emb_channels), nn.SiLU(), nn.Linear(emb_channels, emb_channels))
         
         # Main decoder (for relighting) - uses light embedding
-        self.main_dec = torch.nn.ModuleDict()
+        self.dec = torch.nn.ModuleDict()
         main_block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=1, eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
@@ -307,10 +307,10 @@ class UNet(torch.nn.Module):
         for level, (mult, num_blocks) in reversed(list(enumerate(zip(channel_mult, num_blocks_list)))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.main_dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **main_block_kwargs)
-                self.main_dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **main_block_kwargs)
+                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **main_block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **main_block_kwargs)
             else:
-                self.main_dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **main_block_kwargs)
+                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **main_block_kwargs)
             if len(skips) > 0:
                 skip = skips.pop()
             else:
@@ -319,9 +319,9 @@ class UNet(torch.nn.Module):
                 cin = cout + skip
                 cout = model_channels * mult
                 attn = (idx == num_blocks and res in attn_resolutions)
-                self.main_dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **main_block_kwargs)
+                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **main_block_kwargs)
         
-        self.main_final = nn.Sequential(
+        self.final = nn.Sequential(
             GroupNorm(num_channels=cout, eps=1e-6), 
             nn.SiLU(), 
             Conv2d(in_channels=cout, out_channels=out_channels, kernel=3)
@@ -366,7 +366,7 @@ class UNet(torch.nn.Module):
             if isinstance(layer, UNetBlock):
                 layer.affine_scale = affine_scale
 
-        for layer in self.main_dec.values():
+        for layer in self.dec.values():
             if isinstance(layer, UNetBlock):
                 layer.affine_scale = affine_scale
         
@@ -415,7 +415,7 @@ class UNet(torch.nn.Module):
             x_main = self.pos_embed.expand(light_code.shape[0], -1, -1, -1)
             skips_main = skips.copy()
             
-            for name, block in self.main_dec.items():
+            for name, block in self.dec.items():
                 if ('in1' in name or 'up' in name) and len(skips_main) > 0:
                     skip = skips_main.pop()
                     skip = skip * np.sqrt(skip.shape[1])
@@ -423,7 +423,7 @@ class UNet(torch.nn.Module):
                     x_main = torch.cat([x_main, skip], dim=1)
                 x_main = block(x_main, light_emb)
             
-            outputs['main'] = self.main_final(x_main)
+            outputs['main'] = self.final(x_main)
         
         if decode_mode in ['both', 'normal']:
             skips, light_code = input
