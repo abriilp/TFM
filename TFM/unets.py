@@ -438,8 +438,12 @@ class UNet(torch.nn.Module):
                 if x_normal.shape[1] != block.in_channels:
                     x_normal = torch.cat([x_normal, skip], dim=1)
                 x_normal = block(x_normal)
+
+            raw_normals = self.normal_final(x_normal)
+            normalized_normals = F.normalize(raw_normals, dim=1)
+            outputs['normal'] = normalized_normals
             
-            outputs['normal'] = self.normal_final(x_normal)
+            #outputs['normal'] = self.normal_final(x_normal)
         
         # Return based on decode_mode
         if decode_mode == 'both':
