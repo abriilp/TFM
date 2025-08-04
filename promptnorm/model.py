@@ -269,7 +269,7 @@ def depth_encoder(input_dim, output_dim, num_layers):
 
 class PromptNorm(nn.Module):
     def __init__(self, 
-        inp_channels=3, 
+        inp_channels=6,  # CHANGED: from 3 to 6 to handle concatenated input+reference
         out_channels=3, 
         dim = 32,
         num_blocks = [4,6,6,8], 
@@ -283,9 +283,11 @@ class PromptNorm(nn.Module):
 
         super(PromptNorm, self).__init__()
 
-        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
-        self.patch_embed_depth = OverlapPatchEmbed(3, dim)
+        # CHANGED: Now accepts 6 channels instead of 3
+        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)  # This will now be OverlapPatchEmbed(6, dim)
+        self.patch_embed_depth = OverlapPatchEmbed(3, dim)  # Keep this as 3 for depth/normals
 
+        # ... rest of the code remains the same ...
 
         self.decoder = decoder
         
@@ -333,7 +335,6 @@ class PromptNorm(nn.Module):
         self.noise_level1 = TransformerBlock(dim=int(dim*2**1)+64, num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
         self.reduce_noise_level1 = nn.Conv2d(int(dim*2**1)+64,int(dim*2**1),kernel_size=1,bias=bias)
 
-
         self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
         
         self.refinement = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_refinement_blocks)])
@@ -341,9 +342,11 @@ class PromptNorm(nn.Module):
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
     def forward(self, inp_img, depth_map, noise_emb = None):
+        # inp_img now has 6 channels (3 for input + 3 for reference)
+        # depth_map still has 3 channels (normals)
 
-        inp_enc_level1 = self.patch_embed(inp_img)
-        depth_enc_level1 = self.patch_embed_depth(depth_map)
+        inp_enc_level1 = self.patch_embed(inp_img)  # Now handles 6 channels
+        depth_enc_level1 = self.patch_embed_depth(depth_map)  # Still handles 3 channels
 
         out_enc_level1 = self.encoder_level1(torch.cat([inp_enc_level1, depth_enc_level1], dim=1))
         out_enc_level1, _ = torch.chunk(out_enc_level1, 2, dim=1)
@@ -402,6 +405,8 @@ class PromptNorm(nn.Module):
 
         out_dec_level1 = self.refinement(out_dec_level1)
 
-        out_dec_level1 = self.output(out_dec_level1) + inp_img
+        # IMPORTANT: We need to extract just the input part (first 3 channels) for the residual connection
+        input_only = inp_img[:, :3, :, :]  # Extract first 3 channels (original input)
+        out_dec_level1 = self.output(out_dec_level1) + input_only
 
         return out_dec_level1

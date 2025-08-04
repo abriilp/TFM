@@ -85,8 +85,8 @@ class PromptTrainDataset(Dataset):
 
     def _init_rs_ids(self):
         temp_ids = []
-        rs = self.args.data_file_dir + "rainy/rainTrain.txt"
-        temp_ids+= [self.args.derain_dir + id_.strip() for id_ in open(rs)]
+        rs = "/home/apinyol/TFM/TFM/PromptIR/data_dir/rainy/rainTrain.txt" #self.args.data_file_dir + "rainy/rainTrain.txt"
+        temp_ids+= ["" + id_.strip() for id_ in open(rs)] #self.args.derain_dir
         self.rs_ids = [{"clean_id":x,"de_type":3} for x in temp_ids]
         self.rs_ids = self.rs_ids * 120
 
