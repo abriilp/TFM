@@ -227,8 +227,8 @@ def main():
                              patch_size=opt.patch_size)"""
     # For training
     trainset = ALNDatasetGeomRLSID(
-        root_dir='/data/storage/datasets/RLSID',
-        normals_folder='/home/apinyol/TFM/Data/RLSID/Image/normals',
+        root_dir=opt.root_dir,
+        normals_folder=opt.normals_dir,
         is_validation=False,
         resize_width_to=512,
         patch_size=256,
@@ -238,8 +238,8 @@ def main():
 
     # For validation  
     testset = ALNDatasetGeomRLSID(
-        root_dir='/data/storage/datasets/RLSID',
-        normals_folder='/home/apinyol/TFM/Data/RLSID/Image/normals',
+        root_dir=opt.root_dir,
+        normals_folder=opt.normals_dir,
         is_validation=True,
         resize_width_to=512,
         patch_size=256,
@@ -257,7 +257,7 @@ def main():
     print("Grid format: Input | Reference | Depth/Normals | Restored | Target")
     
     trainer = pl.Trainer( max_epochs=opt.epochs,accelerator="gpu",devices=opt.num_gpus,strategy="ddp_find_unused_parameters_true",logger=logger,callbacks=[checkpoint_callback])
-    trainer.fit(model=model, train_dataloaders=trainloader, val_dataloaders=testloader)
+    trainer.fit(model=model, train_dataloaders=trainloader, val_dataloaders=testloader, ckpt_path=opt.load_ckpt)
 
 
 if __name__ == '__main__':
