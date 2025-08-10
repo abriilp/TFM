@@ -340,4 +340,266 @@ class TestSpecificDataset(Dataset):
     def __len__(self):
         return self.num_img
     
+import os
+import glob
+import random
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision.transforms import ToTensor
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 
+class ALNDatasetRLSID(Dataset):
+    def __init__(self, root_dir, is_validation=False, resize_width_to=None, 
+                 patch_size=None, filter_of_images=None, image_folder='Image', max_training_images=None, max_validation_images=None, split_seed=42):
+        """
+        Modified RLSID Dataset to replace ALNDatasetGeom
+        
+        Args:
+            root_dir: Path to the dataset root directory
+            is_validation: If True, uses validation scenes (20%), else training scenes (80%)
+            resize_width_to: Width to resize images to (maintaining aspect ratio)
+            patch_size: Size for random cropping
+            filter_of_images: List of image filters (scene indices to include)
+            image_folder: Which folder to use ('Image', 'Reflectance', or 'Shading')
+            max_training_images: Maximum number of images for training per epoch (None for all)
+            max_validation_images: Maximum number of images for validation per epoch (None for all)
+            split_seed: Seed for reproducible train/validation split
+        """
+        super(ALNDatasetRLSID, self).__init__()
+        
+        self.root_dir = root_dir
+        self.is_validation = is_validation
+        self.resize_width_to = resize_width_to
+        self.patch_size = patch_size
+        self.filter_of_images = filter_of_images
+        self.max_training_images = max_training_images
+        self.max_validation_images = max_validation_images
+        self.split_seed = split_seed
+        self.image_folder = image_folder
+        
+        # Current epoch number (for reproducible per-epoch sampling)
+        self.current_epoch = 0
+        
+        # Initialize paths and data structures
+        self._init_paths()
+        
+        # Transform to tensor (same as ALNDataset)
+        self.toTensor = ToTensor()
+        
+        # Initialize first epoch
+        self.set_epoch(0)
+        
+    def _init_paths(self):
+        """Initialize image paths and organize by scenes"""
+        # Path to the image directory
+        self.image_dir = os.path.join(self.root_dir, self.image_folder)
+        if not os.path.exists(self.image_dir):
+            raise ValueError(f"Image directory not found: {self.image_dir}")
+        
+        
+        # Get all image files
+        image_files = glob.glob(os.path.join(self.image_dir, "*.png"))
+        
+        # Parse all images and organize by scene_background -> lighting_conditions
+        self.image_data = {}  # scene_background -> lighting -> [image_paths]
+        all_scene_backgrounds = set()
+        
+        for img_path in image_files:
+            try:
+                filename = os.path.basename(img_path)
+                # Parse filename: aaa_bbb_xxx_yyy_zzz.png
+                name_parts = filename.replace('.png', '').split('_')
+                if len(name_parts) >= 5:
+                    scene_idx = name_parts[0]  # aaa
+                    background = name_parts[1]  # bbb
+                    pan = name_parts[2]         # xxx
+                    tilt = name_parts[3]        # yyy
+                    color = name_parts[4]       # zzz
+                    
+                    # Apply filter if specified
+                    if self.filter_of_images is not None:
+                        if scene_idx not in [str(f) for f in self.filter_of_images]:
+                            continue
+                    
+                    scene_background = f"{scene_idx}_{background}"
+                    lighting_condition = f"{pan}_{tilt}_{color}"
+                    
+                    all_scene_backgrounds.add(scene_background)
+                    
+                    if scene_background not in self.image_data:
+                        self.image_data[scene_background] = {}
+                    if lighting_condition not in self.image_data[scene_background]:
+                        self.image_data[scene_background][lighting_condition] = []
+                    
+                    self.image_data[scene_background][lighting_condition].append(img_path)
+                    
+            except (IndexError, ValueError) as e:
+                print(f"Skipping invalid filename: {filename} - {e}")
+                continue
+        
+        # Deterministic 80/20 split using fixed seed
+        all_scene_backgrounds = sorted(list(all_scene_backgrounds))
+        random.seed(self.split_seed)
+        random.shuffle(all_scene_backgrounds)
+        
+        num_scenes = len(all_scene_backgrounds)
+        if num_scenes < 2:
+            raise ValueError(f"Need at least 2 scenes for split, found {num_scenes}")
+        
+        split_idx = max(1, int(num_scenes * 0.8))
+        self.train_scenes = all_scene_backgrounds[:split_idx]
+        self.validation_scenes = all_scene_backgrounds[split_idx:]
+        
+        # Select scenes based on mode
+        if self.is_validation:
+            self.active_scenes = self.validation_scenes
+        else:
+            self.active_scenes = self.train_scenes
+        
+        if not self.active_scenes:
+            mode = "validation" if self.is_validation else "training"
+            raise ValueError(f"No scenes found for {mode} mode")
+        
+        # Pre-compute valid cross-scene pairs
+        self._compute_cross_scene_pairs()
+        
+        # Build ALL possible image pairs list (don't limit here - do it per epoch)
+        self.all_image_paths = []
+        
+        # For each scene in active scenes, create pairs with other scenes
+        for input_scene in self.active_scenes:
+            if input_scene not in self.valid_pairs:
+                continue
+                
+            for input_lighting, input_imgs in self.image_data[input_scene].items():
+                for input_img in input_imgs:
+                    # Find valid reference scenes and lightings
+                    valid_refs = self.valid_pairs[input_scene]
+                    if valid_refs:
+                        for ref_scene, shared_lightings in valid_refs.items():
+                            for ref_lighting in shared_lightings:
+                                ref_imgs = self.image_data[ref_scene][ref_lighting]
+                                for ref_img in ref_imgs:
+                                    # GT: same scene as input, same lighting as reference
+                                    if ref_lighting in self.image_data[input_scene]:
+                                        gt_imgs = self.image_data[input_scene][ref_lighting]
+                                        for gt_img in gt_imgs:
+                                            self.all_image_paths.append({
+                                                'input': input_img,
+                                                'reference': ref_img,
+                                                'target': gt_img
+                                            })
+        
+        # Current epoch image paths (will be set by set_epoch)
+        self.current_image_paths = []
+        
+        print(f"Mode: {'Validation' if self.is_validation else 'Training'}")
+        print(f"Active scenes: {len(self.active_scenes)}")
+        print(f"Total possible image pairs: {len(self.all_image_paths)}")
+        
+        # Determine max images for this mode
+        self.max_images_per_epoch = self.max_validation_images if self.is_validation else self.max_training_images
+        if self.max_images_per_epoch is not None:
+            print(f"Max images per epoch: {self.max_images_per_epoch}")
+        else:
+            print("Using all images every epoch")
+    
+    def set_epoch(self, epoch):
+        """
+        Set the current epoch and sample a random subset of images for this epoch.
+        This should be called at the beginning of each epoch.
+        
+        Args:
+            epoch: Current epoch number
+        """
+        self.current_epoch = epoch
+        
+        if self.max_images_per_epoch is None or self.max_images_per_epoch >= len(self.all_image_paths):
+            # Use all images
+            self.current_image_paths = self.all_image_paths.copy()
+        else:
+            # Sample a random subset for this epoch
+            # Use epoch-specific seed for reproducible but different sampling each epoch
+            epoch_seed = self.split_seed + epoch * 1000
+            random.seed(epoch_seed)
+            self.current_image_paths = random.sample(self.all_image_paths, self.max_images_per_epoch)
+        
+        # Shuffle the current epoch's images for good measure
+        random.shuffle(self.current_image_paths)
+        
+        if epoch == 0 or epoch % 10 == 0:  # Print every 10 epochs to avoid spam
+            print(f"Epoch {epoch}: Using {len(self.current_image_paths)} images")
+    
+    def _compute_cross_scene_pairs(self):
+        """
+        Pre-compute pairs of scenes that share at least one lighting condition.
+        """
+        self.valid_pairs = {}  # input_scene -> {ref_scene: [shared_lightings]}
+        
+        for input_scene in self.active_scenes:
+            if input_scene not in self.image_data:
+                continue
+                
+            input_lightings = set(self.image_data[input_scene].keys())
+            self.valid_pairs[input_scene] = {}
+            
+            # Look for reference scenes in ALL scenes (not just active ones for cross-scene)
+            all_scenes = list(self.image_data.keys())
+            for ref_scene in all_scenes:
+                if ref_scene == input_scene or ref_scene not in self.image_data:
+                    continue
+                
+                ref_lightings = set(self.image_data[ref_scene].keys())
+                shared_lightings = input_lightings.intersection(ref_lightings)
+                
+                if shared_lightings:
+                    self.valid_pairs[input_scene][ref_scene] = list(shared_lightings)
+    
+    def __len__(self):
+        """Return the number of images in the current epoch"""
+        return len(self.current_image_paths)
+    
+    def __getitem__(self, idx):
+        """
+        Returns same format as ALNDatasetGeom:
+        [filename_prefix, 0], concatenated_input, target_img
+        """
+        paths = self.current_image_paths[idx]
+        input_path = paths['input']
+        reference_path = paths['reference']
+        target_path = paths['target']
+        
+        # Load images
+        input_img = self.toTensor(Image.open(input_path).convert('RGB'))
+        reference_img = self.toTensor(Image.open(reference_path).convert('RGB'))
+        target_img = self.toTensor(Image.open(target_path).convert('RGB'))
+        
+        # Apply same transformations as ALNDataset
+        if self.resize_width_to is not None:
+            # Resize maintaining aspect ratio
+            input_img = TF.resize(input_img, (int((input_img.shape[1]*self.resize_width_to)/input_img.shape[2]), self.resize_width_to))
+            reference_img = TF.resize(reference_img, (int((reference_img.shape[1]*self.resize_width_to)/reference_img.shape[2]), self.resize_width_to))
+            target_img = TF.resize(target_img, (int((target_img.shape[1]*self.resize_width_to)/target_img.shape[2]), self.resize_width_to))
+            
+            # Random horizontal flip with probability 0.5
+            if random.random() > 0.5:
+                input_img = TF.hflip(input_img)
+                reference_img = TF.hflip(reference_img)
+                target_img = TF.hflip(target_img)
+        
+        if self.patch_size is not None:
+            # Random crop with same parameters for all images
+            i, j, h, w = transforms.RandomCrop.get_params(input_img, output_size=(self.patch_size, self.patch_size))
+            input_img = TF.crop(input_img, i, j, h, w)
+            reference_img = TF.crop(reference_img, i, j, h, w)
+            target_img = TF.crop(target_img, i, j, h, w)
+        
+        # Concatenate input image with reference image along the channel dimension (same as ALNDataset)
+        concatenated_input = torch.cat([input_img, reference_img], dim=0)
+        
+        # Return same format as ALNDatasetGeom: [filename_prefix, 0], concatenated_input, target_img
+        filename_prefix = os.path.basename(input_path).split('_')[0]
+        
+        return [filename_prefix, 0], concatenated_input, target_img

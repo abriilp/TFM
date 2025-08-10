@@ -1,12 +1,13 @@
 import subprocess
 from tqdm import tqdm
+import os
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from utils.dataset_utils import PromptTrainDataset
+from utils.dataset_utils import PromptTrainDataset, ALNDatasetRLSID
 from net.model import PromptIR
 from utils.schedulers import LinearWarmupCosineAnnealingLR
 import numpy as np
@@ -55,12 +56,26 @@ class PromptIRModel(pl.LightningModule):
 def main():
     print("Options")
     print(opt)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.cuda)
+    print("CUDA devices set to:", os.environ["CUDA_VISIBLE_DEVICES"])
+
     if opt.wblogger is not None:
-        logger  = WandbLogger(project=opt.wblogger,name="PromptIR-Train")
+        logger  = WandbLogger(project=opt.wblogger,name="PromptIR-Train-inputref")
     else:
         logger = TensorBoardLogger(save_dir = "logs/")
 
-    trainset = PromptTrainDataset(opt)
+    #trainset = PromptTrainDataset(opt)
+    # For training
+    trainset = ALNDatasetRLSID(
+        root_dir=opt.root_dir,
+        is_validation=False,
+        resize_width_to=512,
+        patch_size=256,
+        #filter_of_images=[1, 2, 3],  # Optional: only use scenes 001, 002, 003
+        max_training_images=30000
+    )
+
     checkpoint_callback = ModelCheckpoint(dirpath = opt.ckpt_dir,every_n_epochs = 1,save_top_k=-1)
     trainloader = DataLoader(trainset, batch_size=opt.batch_size, pin_memory=True, shuffle=True,
                              drop_last=True, num_workers=opt.num_workers)

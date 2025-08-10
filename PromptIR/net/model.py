@@ -243,7 +243,7 @@ class PromptGenBlock(nn.Module):
 
 class PromptIR(nn.Module):
     def __init__(self, 
-        inp_channels=3, 
+        inp_channels=6,  # Changed from 3 to 6 for concatenated input
         out_channels=3, 
         dim = 48,
         num_blocks = [4,6,6,8], 
@@ -257,7 +257,7 @@ class PromptIR(nn.Module):
 
         super(PromptIR, self).__init__()
 
-        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
+        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)  # Now handles 6 channels
         
         
         self.decoder = decoder
@@ -319,9 +319,14 @@ class PromptIR(nn.Module):
                     
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-    def forward(self, inp_img,noise_emb = None):
-
-        inp_enc_level1 = self.patch_embed(inp_img)
+    def forward(self, inp_img, noise_emb=None):
+        # inp_img now contains concatenated input (6 channels: 3 for input + 3 for reference)
+        
+        # Option 1: Extract the original input image for residual connection
+        original_input = inp_img[:, :3, :, :]  # First 3 channels (original input image)
+        
+        # Process the full concatenated input through the network
+        inp_enc_level1 = self.patch_embed(inp_img)  # Now processes 6 channels
 
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
         
@@ -335,6 +340,7 @@ class PromptIR(nn.Module):
 
         inp_enc_level4 = self.down3_4(out_enc_level3)        
         latent = self.latent(inp_enc_level4)
+        
         if self.decoder:
             dec3_param = self.prompt3(latent)
 
@@ -373,8 +379,6 @@ class PromptIR(nn.Module):
 
         out_dec_level1 = self.refinement(out_dec_level1)
 
-
-        out_dec_level1 = self.output(out_dec_level1) + inp_img
-
+        out_dec_level1 = self.output(out_dec_level1) + original_input  # Residual with original input
 
         return out_dec_level1
