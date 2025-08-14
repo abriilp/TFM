@@ -22,7 +22,8 @@ echo "NODELIST="${SLURM_NODELIST}
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$master_addr
 echo "MASTER_ADDR="$MASTER_ADDR
-data_path=/home/apinyol/TFM/Data/RSR_256 #_mini
+data_path=/data/storage/datasets/RLSID
+#/home/apinyol/TFM/Data/RSR_256 #_mini
 #/home/apinyol/TFM/Data/RSR_256
 #/home/apinyol/TFM/Data/iiw-dataset/data
 #/home/apinyol/TFM/Data/multi_illumination_train_mip2_jpg
@@ -33,22 +34,23 @@ python -m torch.distributed.launch \
 --reg_weight 1e-4 \
 --intrinsics_loss_weight 1e-1 \
 --epochs 50 \
---batch_size 1 \
+--batch_size 2 \
 --learning_rate 2e-4 \
 --weight_decay 1e-2 \
---wandb_project "intrinsic relighting2" \
---wandb_run_name "proves_normals_decoder" \
---dataset rsr_256 \
---experiment_name "proves_normals_decoder" \
---resume_from /home/apinyol/TFM/Models/last.pth.tar \
+--wandb_project "LatentIntrinscis" \
+--wandb_run_name "with_normalsloss" \
+--dataset rlsid \
+--experiment_name "with_normalsloss" \
+--resume_from TFM/Latent_intrinsics/checkpoints/with_normalsloss_20250814_190554_1ada328d/epoch_0001.pth.tar \
 --enable_normal_loss \
+#--enable_normal_loss \
 #--enable_normal_loss \
 #--enable_depth_loss
 
 #--normal_loss_weight 1e-1 \
 #--enable_depth_loss \
 
-
+#/home/apinyol/TFM/Models/last.pth.tar \
 
 # Start new experiment
 #--experiment_name "depth_ablation" --learning_rate 0.001
