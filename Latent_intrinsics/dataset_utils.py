@@ -6,7 +6,7 @@ import random
 import glob
 
 class RSRDataset(Dataset):
-    def __init__(self, root_dir, img_transform=None, scenes=None, is_validation=False, validation_scenes=None):
+    def __init__(self, root_dir, img_transform=None, scenes=None, is_validation=False, validation_scenes=None, use_all_scenes=False):
         """
         RSR Dataset for relighting tasks
         
@@ -16,9 +16,11 @@ class RSRDataset(Dataset):
             scenes: List of scene names to use. If None, auto-splits all scenes (all-2 for train, 2 for val)
             is_validation: If True, enables validation mode with cross-scene references
             validation_scenes: Specific scenes to use for validation (only used when scenes=None)
+            use_all_scenes: If True, uses all available scenes regardless of other parameters
         """
         self.root_dir = root_dir
         self.is_validation = is_validation
+        self.use_all_scenes = use_all_scenes
         
         # Handle transform assignment
         if img_transform is not None and isinstance(img_transform, list):
@@ -33,7 +35,11 @@ class RSRDataset(Dataset):
                      if os.path.isdir(os.path.join(root_dir, d))]
         all_scenes.sort()  # Sort for reproducible splits
         
-        if scenes is not None:
+        if self.use_all_scenes:
+            # Use all available scenes
+            self.scenes = all_scenes
+            print(f"Using all scenes: {self.scenes}")
+        elif scenes is not None:
             # Use explicitly provided scenes
             self.scenes = [s for s in scenes if s in all_scenes]
         else:
@@ -60,6 +66,9 @@ class RSRDataset(Dataset):
                 # Training: use all scenes except validation scenes
                 self.scenes = [s for s in all_scenes if s not in val_scenes]
             
+        # Store all available scenes for validation mode if not already set
+        if self.is_validation and not hasattr(self, 'all_available_scenes'):
+            self.all_available_scenes = all_scenes
                 
         if not self.scenes:
             raise ValueError(f"No valid scenes found in {root_dir}")

@@ -1,5 +1,5 @@
 # general settings
-name: Pretraining_ISR_compiled_Restormer
+name: TFG_Maria_normals_Inference
 model_type: ImageCleanModel
 scale: 1
 num_gpu: 1  # set num_gpu: 0 for cpu mode
@@ -35,8 +35,8 @@ datasets:
 # network structures
 network_g:
   type: Restormer
-  inp_channels: 3
-  out_channels: 3
+  inp_channels: 6  # Changed from 3 to 6 (3 for RGB + 3 for normals)
+  out_channels: 3  # Keep as 3 since output is still RGB
   dim: 48
   num_blocks: [4,6,6,8]
   num_refinement_blocks: 4
@@ -46,11 +46,11 @@ network_g:
   LayerNorm_type: BiasFree
   dual_pixel_task: False
 
-
 # path
 path:
-  pretrain_network_g: ~ #'/home/mpilligua/Restormer/experiments/Pretraining_ISR_compiled_Restormer/models/net_g_latest.pth'
-  strict_load_g: true
+  pretrain_network_g: /home/apinyol/TFM/TFM/Restormer/experiments/TFG_Maria_normals/models/net_g_latest.pth # Set to ~ (None) since the pretrained model has different input channels
+  # pretrain_network_g: '/home/apinyol/TFM/TFM/Restormer/experiments/Pretraining_ISR_compiled_Restormer_archived_20250818_120920/models/net_g_latest.pth'
+  strict_load_g: false  # Changed to false to allow partial loading if you do use a pretrained model
   resume_state: ~
 
 # training settings

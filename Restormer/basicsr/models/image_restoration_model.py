@@ -26,19 +26,21 @@ class Mixing_Augment:
     def __init__(self, mixup_beta, use_identity, device):
         self.dist = torch.distributions.beta.Beta(torch.tensor([mixup_beta]), torch.tensor([mixup_beta]))
         self.device = device
-
         self.use_identity = use_identity
-
         self.augments = [self.mixup]
 
     def mixup(self, target, input_):
         lam = self.dist.rsample((1,1)).item()
-    
-        r_index = torch.randperm(target.size(0)).to(self.device)
-    
-        target = lam * target + (1-lam) * target[r_index, :]
-        input_ = lam * input_ + (1-lam) * input_[r_index, :]
-    
+        
+        # Get batch size for proper indexing
+        batch_size = target.size(0)
+        r_index = torch.randperm(batch_size).to(self.device)
+        
+        # Apply mixup - this works regardless of tensor dimensions
+        # as long as target and input_ have the same shape
+        target = lam * target + (1-lam) * target[r_index]
+        input_ = lam * input_ + (1-lam) * input_[r_index]
+        
         return target, input_
 
     def __call__(self, target, input_):
@@ -69,16 +71,32 @@ class ImageCleanModel(BaseModel):
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
         
-        print('Compiling the generator network...')
+        """print('Compiling the generator network...')
         self.net_g = torch.compile(self.net_g)
         print('Generator network compiled successfully.')
-
+        """
         # load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
         print("Loading pretrained generator from:", load_path)
         if load_path is not None:
             self.load_network(self.net_g, load_path,
                               self.opt['path'].get('strict_load_g', True), param_key=self.opt['path'].get('param_key', 'params'))
+        if opt['network_g'].get('inp_channels', 3) == 6 :
+            # Compile AFTER loading and with correct input channels
+            print('Compiling the generator network with 6 input channels...')
+            
+            # Create a dummy input to help torch.compile understand the new shape
+            dummy_input = torch.randn(1, 6, 256, 256).to(self.device)  # 6 channels now
+            dummy_light = torch.randn(1, 2).to(self.device)
+            
+            # Warm up the model with the new input shape
+            with torch.no_grad():
+                _ = self.net_g(dummy_input, dummy_light)
+            
+            # Now compile with the correct shapes
+            self.net_g = torch.compile(self.net_g)
+            print('Generator network compiled successfully with 6 channels.')
+
 
         if self.is_train:
             self.init_training_settings()
@@ -280,16 +298,19 @@ class ImageCleanModel(BaseModel):
             if save_img:
                 
                 # print(f'Saving {img_name}... to {self.opt["path"]["visualization_test"]}')
-                fig, ax = plt.subplots(1, 3, figsize=(12, 5))
+                fig, ax = plt.subplots(1, 4, figsize=(16, 5))
                 ax[0].imshow(tensor2img([visuals['lq']])[:, :, ::-1])
                 ax[0].set_title('Input')
-                ax[1].imshow(sr_img.clip(0, 255).astype('uint8')[:, :, ::-1])
-                ax[1].set_title(f"{val_data['des_light'][0][0].item():.2f}, {val_data['des_light'][0][1].item():.2f}")
-                ax[2].imshow(gt_img[:, :, ::-1])
-                ax[2].set_title('GT')
+                ax[1].imshow(tensor2img([visuals['normals']])[:, :, ::-1])
+                ax[1].set_title('Normals')
+                ax[2].imshow(sr_img.clip(0, 255).astype('uint8')[:, :, ::-1])
+                ax[2].set_title(f"{val_data['des_light'][0][0].item():.2f}, {val_data['des_light'][0][1].item():.2f}")
+                ax[3].imshow(gt_img[:, :, ::-1])
+                ax[3].set_title('GT')
                 ax[0].axis('off')
                 ax[1].axis('off')
                 ax[2].axis('off')
+                ax[3].axis('off')
                 
                 os.makedirs(osp.join(self.opt['path']['visualization_dir'], dataset_name), exist_ok=True)
                 
@@ -352,7 +373,8 @@ class ImageCleanModel(BaseModel):
 
     def get_current_visuals(self):
         out_dict = OrderedDict()
-        out_dict['lq'] = self.lq.detach().cpu()
+        out_dict['lq'] = self.lq.detach().cpu()[:, :3, :, :]
+        out_dict['normals'] = self.lq.detach().cpu()[:, 3:, :, :]
         out_dict['result'] = self.output.detach().cpu()
         if hasattr(self, 'gt'):
             out_dict['gt'] = self.gt.detach().cpu()

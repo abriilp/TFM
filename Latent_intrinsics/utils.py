@@ -1072,11 +1072,13 @@ class DepthNormalConsistencyLoss(torch.nn.Module):
                  normals_model_name="GonzaloMG/marigold-e2e-ft-normals",
                  device='cuda',
                  enable_depth=True,
-                 enable_normals=True):
+                 enable_normals=True,
+                 enable_normals_decoder=True):
         super().__init__()
         self.device = device
         self.enable_depth = enable_depth
         self.enable_normals = enable_normals
+        self.enable_normals_decoder = enable_normals_decoder
         
         # Load Depth model if enabled
         if self.enable_depth:
@@ -1104,14 +1106,13 @@ class DepthNormalConsistencyLoss(torch.nn.Module):
             for param in self.normal_pipe.vae.parameters():
                 param.requires_grad = False
 
-    def forward(self, img1, img2):
+    def forward(self, img1, img2, normals1=None):
         """
         Compute depth and/or normal consistency loss between two images
         img1, img2: (B, C, H, W) in range [-1, 1]
         """
         total_loss = torch.tensor(0.0, device=img1.device)
         depth1, depth2 = None, None
-        normals1, normals2 = None, None
         depth_loss, normal_loss = None, None
         
         # Depth consistency loss
@@ -1126,17 +1127,15 @@ class DepthNormalConsistencyLoss(torch.nn.Module):
             # Compute L1 loss between depth maps
             depth_loss = F.l1_loss(depth1_norm, depth2_norm)
             total_loss += depth_loss
-        
-        # Normal consistency loss
+    
+        # Normals loss (if provided)
         if self.enable_normals:
-            normals1 = self.get_normal_map(img1.detach())
+            if normals1 is None:
+                print("Normals1 are noot provided they will be infered with the defined normals model.")
+                normals1 = self.get_normal_map(img1.detach())
             normals2 = self.get_normal_map(img2)
-            
-            # Normalize normal maps if needed
             normals1_norm = self.normalize_normal_maps(normals1)
             normals2_norm = self.normalize_normal_maps(normals2)
-            
-            # Compute angular loss between normal maps (cosine similarity)
             normal_loss = self.compute_normal_loss(normals1_norm, normals2_norm)
             total_loss += normal_loss
 

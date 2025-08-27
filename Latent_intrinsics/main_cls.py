@@ -186,6 +186,7 @@ parser.add_argument('--normals_model_name', type=str,
 parser.add_argument('--enable_normals_decoder_loss', action='store_true', help='Enable normals decoder loss')
 parser.add_argument('--normals_decoder_loss_weight', type=float, default=1.0, help='Weight for normals decoder loss')
 
+parser.add_argument('--original', action='store_true', help='run code with original recon loss')
 
 args = parser.parse_args()
 
@@ -214,11 +215,10 @@ def init_model(args):
             normals_model_name=getattr(args, 'normals_model_name', 'GonzaloMG/marigold-e2e-ft-normals'),
             device=args.gpu,
             enable_depth=getattr(args, 'enable_depth_loss', False),
-            enable_normals=(
-            getattr(args, 'enable_normal_loss', False) or 
-            getattr(args, 'enable_normals_decoder_loss', False)
+            enable_normals=getattr(args, 'enable_normal_loss', False),
+            enable_normals_decoder=getattr(args, 'enable_normals_decoder_loss', False)
         )
-        )
+        
 
     return model, ema_model, optimizer, depth_normal_loss_fn
 
@@ -535,25 +535,27 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
     logdet_loss_ext = compute_logdet_loss()
     ssim_loss = compute_SSIM_loss()
 
-    #for i, (input_img, ref_img, gt_normals_input) in enumerate(train_loader):
-    #for i, (input_img, ref_img) in enumerate(train_loader):
     for i, batch in enumerate(train_loader):
+        """if i>=2:
+            break  # skip iters per debug cutre """
 
         if len(batch) > 2:
             input_img, ref_img, input_normals = batch
+            input_img = input_img.to(args.gpu)
+            ref_img = ref_img.to(args.gpu)
+            gt_normals_input = input_normals.to(args.gpu)
+            gt_img = ref_img
         else:
             input_img, ref_img = batch
+            input_img = input_img.to(args.gpu)
+            ref_img = ref_img.to(args.gpu)
             gt_img = ref_img
-        """if i>=2:
-            break  # Limit to first 5 batches for debugging"""
+        
         current_step = global_step + i
         #gt_normals_ref = gt_normals_input.clone()
         
         # Start timing the step
         step_start_time = time.time()
-        
-        input_img = input_img.to(args.gpu)
-        ref_img = ref_img.to(args.gpu)
 
         # Add noise
         rnd_normal = torch.randn([input_img.shape[0], 1, 1, 1], device=input_img.device)
@@ -567,19 +569,31 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         # Forward pass timing
         forward_start_time = time.time()
         with torch.cuda.amp.autocast():
-            intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder=True)
-            intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder=True)
+            if getattr(args, 'original', False):
+                # ORIGINAL CODE
+                intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder = True)
+                intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder = True)
 
-            # Reconstruct images
-            recon_img_rr, normals_ref = model([intrinsic_ref, extrinsic_ref], run_encoder=False, decode_mode='both')
-            recon_img_ir, normals_input = model([intrinsic_input, extrinsic_ref], run_encoder=False, decode_mode='both')
-            recon_img_ri, _ = model([intrinsic_ref, extrinsic_input], run_encoder=False, decode_mode='both')
-            recon_img_ii, _ = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_mode='both')
+                mask = (torch.rand(input_img.shape[0]) > 0.9).float().to(args.gpu).reshape(-1,1,1,1).float()
+                intrinsic = [i_input * mask + i_ref * (1 - mask) for i_input, i_ref in zip(intrinsic_input, intrinsic_ref)]
+
+                recon_img_ir = model([intrinsic, extrinsic_ref], run_encoder = False, decode_mode='main').float()
+
+            else:
+                # UPDATED LOSSES AND NORMALS DECODER ADAPTED MODEL
+                intrinsic_input, extrinsic_input = model(noisy_input_img, run_encoder=True)
+                intrinsic_ref, extrinsic_ref = model(noisy_ref_img, run_encoder=True)
+
+                # Reconstruct images
+                recon_img_rr, _ = model([intrinsic_ref, extrinsic_ref], run_encoder=False, decode_mode='both')
+                recon_img_ir, normals_input = model([intrinsic_input, extrinsic_ref], run_encoder=False, decode_mode='both')
+                recon_img_ri, _ = model([intrinsic_ref, extrinsic_input], run_encoder=False, decode_mode='both')
+                recon_img_ii, _ = model([intrinsic_input, extrinsic_input], run_encoder=False, decode_mode='both')
+                
+                recon_img_rr, recon_img_ir, recon_img_ri, recon_img_ii, normals_input= recon_img_ii.float(), recon_img_ir.float(), recon_img_ri.float(), recon_img_ii.float(), normals_input.float()
+                
             
-            recon_img_rr, recon_img_ir, recon_img_ri, recon_img_ii, normals_input, normals_ref= recon_img_ii.float(), recon_img_ir.float(), recon_img_ri.float(), recon_img_ii.float(), normals_input.float(), normals_ref.float()
-            # Generate normals from the new decoder (using intrinsics only)
-            #normals_input = model(intrinsic_input, run_encoder=False, decode_mode='normal').float()
-            #normals_ref = model(intrinsic_ref, run_encoder=False, decode_mode='normal').float()
+
         forward_time = time.time() - forward_start_time
         if i%100 == 0 or i==0 and args.is_master and not args.disable_wandb:
             try:
@@ -597,12 +611,18 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
 
         # Loss computation timing
         loss_start_time = time.time()
-        # Compute losses
-        rec_loss_total = compute_reconstruction_loss(
-            [(recon_img_rr, ref_img), (recon_img_ir, ref_img), 
-             (recon_img_ri, input_img), (recon_img_ii, input_img)], 
-            ssim_loss
-        )
+        if getattr(args, 'original', False):
+            # ORIGINAL CODE
+            rec_loss_total = compute_reconstruction_loss(
+                [(recon_img_ir, ref_img)], ssim_loss
+            )
+        else:
+            # Compute losses
+            rec_loss_total = compute_reconstruction_loss(
+                [(recon_img_rr, ref_img), (recon_img_ir, ref_img), 
+                (recon_img_ri, input_img), (recon_img_ii, input_img)], 
+                ssim_loss
+            )
         
         logdet_pred, logdet_target = logdet_loss(intrinsic_input)
         logdet_pred_ext, logdet_target_ext = logdet_loss_ext([extrinsic_input])
@@ -616,50 +636,26 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
         # Enhanced depth and normal loss
         depth_loss_value = torch.tensor(0.0, device=input_img.device)
         normal_loss_value = torch.tensor(0.0, device=input_img.device)
+        normals_input_loss_value = torch.tensor(0.0, device=input_img.device)
         
         if depth_normal_loss_fn is not None:
-            try:
-                #total_geom_loss, depth_loss_component, normal_loss_component = depth_normal_loss_fn(input_img, recon_img_ri)
-                
-                # You can separate depth and normal losses if needed by calling them individually
-                if getattr(args, 'enable_depth_loss', False) and getattr(args, 'enable_normal_loss', False):
-                    # Both enabled
-                    total_geom_loss, depth_loss_value, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
-                elif getattr(args, 'enable_depth_loss', False):
-                    total_geom_loss, depth_loss_value, _, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
-                elif getattr(args, 'enable_normal_loss', False):
-                    total_geom_loss, _, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
-                    
-            except Exception as e:
-                print(f"Warning: Depth/Normal loss computation failed: {e}")
-                total_geom_loss = torch.tensor(0.0, device=input_img.device)
-
-        # Combine geometric losses
-        depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
-        normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
-        
-        # normals decoder loss
-        normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
-        if getattr(args, 'enable_normals_decoder_loss', False) and depth_normal_loss_fn is not None:
-            try:
-                # Extract ground truth normals from depth_normal_loss_fn
-                # We'll use the input image to get ground truth normals
-                gt_normals_input, gt_normals_ref = depth_normal_loss_fn.get_normal_map(input_img), depth_normal_loss_fn.get_normal_map(ref_img)
-                if gt_normals_input is not None:
-                    _, _, normals_input_loss_value, _, _, _, _ = depth_normal_loss_fn(gt_normals_input.to(args.gpu), normals_input.to(args.gpu))
-                    normals_decoder_loss_value += normals_input_loss_value
-                    
-                # Also add consistency loss between input and reference normals when they should be similar
-                if gt_normals_ref is not None:
-                    _, _, normals_ref_loss_value , _, _, _, _ = depth_normal_loss_fn(gt_normals_ref.to(args.gpu), normals_ref.to(args.gpu))
-                    normals_decoder_loss_value += normals_ref_loss_value
+            """try:"""
+            #total_geom_loss, depth_loss_component, normal_loss_component = depth_normal_loss_fn(input_img, recon_img_ri)
+            if getattr(args, 'enable_depth_loss', False):
+                _, depth_loss_value, _, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri)
+            if getattr(args, 'enable_normal_loss', False):
+                _, _, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ri, normals1=normals_input)
+            if getattr(args, 'enable_normals_decoder_loss', False):
+                gt_normals_input_norm = depth_normal_loss_fn.normalize_normal_maps(gt_normals_input)
+                normals_input_norm = depth_normal_loss_fn.normalize_normal_maps(normals_input)
+                normals_input_loss_value = depth_normal_loss_fn.compute_normal_loss(gt_normals_input_norm, normals_input_norm)
 
                 if i%100 == 0 or i==0 and args.is_master and not args.disable_wandb: # Log normals decoder results every 100 steps
                     try:
                         def normalize_normals_for_logging(normals: torch.Tensor) -> torch.Tensor:
                             """
                             Convert normalized surface normals (range [-1, 1]) to uint8 image format (range [0, 255]).
-                            
+                                
                             Args:
                                 normals (torch.Tensor): shape [B, 3, H, W], values in [-1, 1]
 
@@ -673,20 +669,22 @@ def train_epoch(train_loader, model, scaler, optimizer, ema_model, epoch, args, 
                         log_relighting_results(
                             input_img=normalize_normals_for_logging(gt_normals_input.to(args.gpu)),
                             ref_img=normalize_normals_for_logging(normals_input.to(args.gpu)),
-                            relit_img=normalize_normals_for_logging(gt_normals_ref.to(args.gpu)),
-                            gt_img=normalize_normals_for_logging(normals_ref.to(args.gpu)),
+                            relit_img=normalize_normals_for_logging(gt_normals_input.to(args.gpu)),
+                            gt_img=normalize_normals_for_logging(normals_input.to(args.gpu)),
                             step=current_step,
-                            mode='normals_decoder'
-)
+                            mode='normals_decoder' #només ho he fet amb input normals i per no fer una altra funció utilitzo lo de 4 columnes encara q siguin dos repetides
+                            )
                     except Exception as e:
                         print(f"Warning: Failed to log normals decoder results: {e}")
                     
-                        
+            """
             except Exception as e:
-                print(f"Warning: Normals decoder loss computation failed: {e}")
-                normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
-        
-        normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_decoder_loss_value
+                print(f"Warning: Depth/Normal loss computation failed: {e}")"""
+
+        # Combine geometric losses
+        depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
+        normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
+        normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_input_loss_value
        
         # Total loss
         total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
@@ -793,11 +791,22 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 
                 if len(batch) > 3:
                     input_img, ref_img, gt_img, gt_normals_input, gt_normals_ref = batch
+                    input_img = input_img.to(args.gpu)
+                    ref_img = ref_img.to(args.gpu)
+                    gt_normals_input = gt_normals_input.to(args.gpu)
+                    gt_img = gt_img.to(args.gpu)
                 elif len(batch) == 3:
                     input_img, ref_img, gt_img = batch
+                    input_img = input_img.to(args.gpu)
+                    ref_img = ref_img.to(args.gpu)
+                    gt_normals_input = gt_normals_input.to(args.gpu)
+                    gt_img = gt_img.to(args.gpu)
                 else:
                     input_img, ref_img = batch
+                    input_img = input_img.to(args.gpu)
+                    ref_img = ref_img.to(args.gpu)
                     gt_img = ref_img
+        
                 
                 input_img = input_img.to(args.gpu)
                 ref_img = ref_img.to(args.gpu)
@@ -829,73 +838,59 @@ def validate_multi_datasets(validation_loaders, model, epoch, args, current_step
                 
                 sim_intrinsic = intrinsic_loss(intrinsic_input, intrinsic_ref)
                 intrinsic_loss_component = args.intrinsics_loss_weight * sim_intrinsic
-
-                # Depth and normal loss for validation
+                
+                 # Enhanced depth and normal loss
                 depth_loss_value = torch.tensor(0.0, device=input_img.device)
                 normal_loss_value = torch.tensor(0.0, device=input_img.device)
-                input_depth, relit_depth = None, None
-                input_normals, relit_normals = None, None
+                normals_input_loss_value = torch.tensor(0.0, device=input_img.device)
                 
                 if depth_normal_loss_fn is not None:
                     try:
                         #total_geom_loss, depth_loss_component, normal_loss_component = depth_normal_loss_fn(input_img, recon_img_ri)
-                        
-                        # You can separate depth and normal losses if needed by calling them individually
-                        if getattr(args, 'enable_depth_loss', False) and getattr(args, 'enable_normal_loss', False):
-                            # Both enabled
-                            total_geom_loss, depth_loss_value, normal_loss_value, input_depth, relit_depth, input_normals, relit_normals = depth_normal_loss_fn(input_img, recon_img_ir)
-                        elif getattr(args, 'enable_depth_loss', False):
-                            total_geom_loss, depth_loss_value, _, input_depth, relit_depth, _, _= depth_normal_loss_fn(input_img, recon_img_ir)
-                        elif getattr(args, 'enable_normal_loss', False):
-                            total_geom_loss, _, normal_loss_value, _, _, input_normals, relit_normals = depth_normal_loss_fn(input_img, recon_img_ir)
+                        if getattr(args, 'enable_depth_loss', False):
+                            _, depth_loss_value, _, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ir)
+                        if getattr(args, 'enable_normal_loss', False):
+                            _, _, normal_loss_value, _, _, _, _ = depth_normal_loss_fn(input_img, recon_img_ir, normals1=normals_input)
+                        if getattr(args, 'enable_normals_decoder_loss', False):
+                            gt_normals_input_norm = depth_normal_loss_fn.normalize_normal_maps(gt_normals_input)
+                            normals_input_norm = depth_normal_loss_fn.normalize_normal_maps(normals_input)
+                            normals_input_loss_value = depth_normal_loss_fn.compute_normal_loss(gt_normals_input_norm, normals_input_norm)
+
+                            if i%100 == 0 or i==0 and args.is_master and not args.disable_wandb: # Log normals decoder results every 100 steps
+                                try:
+                                    def normalize_normals_for_logging(normals: torch.Tensor) -> torch.Tensor:
+                                        """
+                                        Convert normalized surface normals (range [-1, 1]) to uint8 image format (range [0, 255]).
+                                        
+                                        Args:
+                                            normals (torch.Tensor): shape [B, 3, H, W], values in [-1, 1]
+
+                                        Returns:
+                                            torch.Tensor: shape [B, 3, H, W], values in [0, 255], dtype=torch.uint8
+                                        """
+                                        normals = torch.clamp(normals, -1, 1)         # Ensure range is bounded
+                                        img = (normals + 1.0) * 127.5                 # Map from [-1,1] → [0,255]
+                                        return img#.to(dtype=torch.uint8)
+
+                                    log_relighting_results(
+                                        input_img=normalize_normals_for_logging(gt_normals_input.to(args.gpu)),
+                                        ref_img=normalize_normals_for_logging(normals_input.to(args.gpu)),
+                                        relit_img=normalize_normals_for_logging(gt_normals_input.to(args.gpu)),
+                                        gt_img=normalize_normals_for_logging(normals_input.to(args.gpu)),
+                                        step=current_step,
+                                        mode='normals_decoder' #només ho he fet amb input normals i per no fer una altra funció utilitzo lo de 4 columnes encara q siguin dos repetides
+                                        )
+                                except Exception as e:
+                                    print(f"Warning: Failed to log normals decoder results: {e}")
                             
+                        
                     except Exception as e:
                         print(f"Warning: Depth/Normal loss computation failed: {e}")
-                        total_geom_loss = torch.tensor(0.0, device=input_img.device)
-                
+
+                # Combine geometric losses
                 depth_loss_component = getattr(args, 'depth_loss_weight', 0.0) * depth_loss_value
                 normal_loss_component = getattr(args, 'normal_loss_weight', 0.0) * normal_loss_value
-
-                normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
-                if getattr(args, 'enable_normals_decoder_loss', False) and depth_normal_loss_fn is not None:
-                    try:
-                        # Extract ground truth normals from depth_normal_loss_fn
-                        # We'll use the input image to get ground truth normals
-                        
-                        
-                        
-                        if gt_normals_input is not None:
-                            _, _, normals_input_loss_value, _, _, _, _ = depth_normal_loss_fn(gt_normals_input.to(args.gpu), normals_input.to(args.gpu))
-                            normals_decoder_loss_value += normals_input_loss_value
-                            
-                        # Also add consistency loss between input and reference normals when they should be similar
-                        if gt_normals_ref is not None:
-                            _, _, normals_ref_loss_value , _, _, _, _ = depth_normal_loss_fn(gt_normals_ref.to(args.gpu), normals_ref.to(args.gpu))
-                            normals_decoder_loss_value += normals_ref_loss_value
-                        
-                        # Log visualizations for first batch only
-                        if i == 0 and args.is_master and not args.disable_wandb:
-                            try:
-                                def normalize_normals_for_logging(normals):
-                                    return (normals + 1) / 2  # maps [-1, 1] to [0, 1]
-                                # Standard relighting visualization
-                                log_relighting_results(
-                                    input_img=normalize_normals_for_logging(gt_normals_input.to(args.gpu)),
-                                    ref_img=normalize_normals_for_logging(normals_input.to(args.gpu)),
-                                    relit_img=normalize_normals_for_logging(gt_normals_ref.to(args.gpu)),
-                                    gt_img=normalize_normals_for_logging(normals_ref.to(args.gpu)),
-                                    step=current_step,
-                                    mode=f'{dataset_name}_validation'
-                                    )
-                            except:
-                                print(f"Warning: Failed to log normalsj {dataset_name} validation")
-                            
-                                
-                    except Exception as e:
-                        print(f"Warning: Normals decoder loss computation failed: {e}")
-                        normals_decoder_loss_value = torch.tensor(0.0, device=input_img.device)
-                
-                normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_decoder_loss_value
+                normals_decoder_loss_component = getattr(args, 'normals_decoder_loss_weight', 0.0) * normals_input_loss_value
                 
                 batch_total_loss = (rec_loss_total + logdet_reg_loss + intrinsic_loss_component + 
                                   logdet_ext_reg_loss + depth_loss_component + normal_loss_component + normals_decoder_loss_component)

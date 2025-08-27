@@ -331,6 +331,14 @@ class Restormer(nn.Module):
             out_dec_level1 = out_dec_level1 + self.skip_conv(inp_enc_level1)
             out_dec_level1 = self.output(out_dec_level1)
         else:
-            out_dec_level1 = self.output(out_dec_level1) + inp_img
+            if inp_img.size(1) == out_dec_level1.size(1):
+                out_dec_level1 = self.output(out_dec_level1)
+                # Same channels: normal residual connection
+                out_dec_level1 = out_dec_level1 + inp_img
+            else:
+                out_dec_level1 = self.output(out_dec_level1)
+                # Different channels: only add RGB part of input (first 3 channels)
+                inp_rgb = inp_img[:, :3, :, :]  # Extract RGB channels
+                out_dec_level1 = out_dec_level1 + inp_rgb
 
         return out_dec_level1

@@ -364,15 +364,15 @@ class Dataset_DefocusDeblur_DualPixel_16bit(data.Dataset):
     def __len__(self):
         return len(self.paths)
 
-
-
-
 class IRSDataset(data.Dataset):
     def __init__(self, opt, seed=0):
         super(IRSDataset, self).__init__()
         self.opt = opt
         self.image_root_path = "/data/124-1/datasets/ISR/"
         self.scenes = sorted(os.listdir(self.image_root_path))
+
+        # Add normals root path - you'll need to specify the correct path
+        self.normals_root_path = "/data/124-1/datasets/ISR_normals" 
 
         self.name = opt['name']
         if self.name == "ValSet":
@@ -413,6 +413,16 @@ class IRSDataset(data.Dataset):
 
         gt_path = gt_obj['img_path']
         lq_path = lq_obj['img_path']
+        
+        # Construct normals path from lq_path
+        # Extract filename and construct path in normals folder
+        lq_filename = os.path.basename(lq_path)
+        # Get the relative path structure from image_root_path
+        relative_path = os.path.relpath(lq_path, self.image_root_path)
+        # Replace the root path with normals root path
+        normals_path = os.path.join(self.normals_root_path, relative_path)
+        # Alternative approach if the above doesn't work:
+        # normals_path = lq_path.replace(self.image_root_path, self.normals_root_path)
 
         # image range: [0, 1], float32., H W 3
         img_bytes = self.file_client.get(gt_path, 'gt')
@@ -420,6 +430,10 @@ class IRSDataset(data.Dataset):
 
         img_bytes = self.file_client.get(lq_path, 'lq')
         img_lq = imfrombytes(img_bytes, float32=True)
+
+        # Load normals
+        normals_bytes = self.file_client.get(normals_path, 'normals')
+        img_normals = imfrombytes(normals_bytes, float32=True)
 
         # augmentation for training
         # if self.opt['phase'] == 'train':
@@ -433,24 +447,36 @@ class IRSDataset(data.Dataset):
         if 'color' in self.opt and self.opt['color'] == 'y':
             img_gt = bgr2ycbcr(img_gt, y_only=True)[..., None]
             img_lq = bgr2ycbcr(img_lq, y_only=True)[..., None]
+            # Note: normals typically don't need color space transform
 
         # BGR to RGB, HWC to CHW, numpy to tensor
-        img_gt, img_lq = img2tensor([img_gt, img_lq], bgr2rgb=True, float32=True)
+        img_gt, img_lq, img_normals = img2tensor([img_gt, img_lq, img_normals], bgr2rgb=True, float32=True)
+        
         # normalize
         if self.mean is not None or self.std is not None:
             normalize(img_lq, self.mean, self.std, inplace=True)
             normalize(img_gt, self.mean, self.std, inplace=True)
+            # Normals are typically already normalized or need different normalization
+            # normalize(img_normals, self.mean, self.std, inplace=True)  # Uncomment if needed
 
         # print(img_lq.shape,img_gt.shape,img_lq.min(),img_gt.min(),img_lq.max(),img_gt.max(),lq_path,gt_path)
+        concat_input = torch.cat([img_lq, img_normals], dim=0)
 
-        return {'lq': img_lq, 'gt': img_gt, 'lq_path': lq_path, 'gt_path': gt_path, 'des_light': des_light}
-
-
+        return {
+            'lq': concat_input, #img_lq, 
+            'gt': img_gt, 
+            #'normals': img_normals,
+            'lq_path': lq_path, 
+            'gt_path': gt_path, 
+            #'normals_path': normals_path,
+            'des_light': des_light
+        }
+    
 class CustomDataset(data.Dataset):
     def __init__(self, opt, seed=0):
         super(CustomDataset, self).__init__()
         self.opt = opt
-        self.image_root_path = "/data/124-1/datasets/RSR_256/"
+        self.image_root_path = "/data/storage/datasets/RSR_256/"
         self.scenes = sorted(os.listdir(self.image_root_path))
 
         self.name = opt['name']

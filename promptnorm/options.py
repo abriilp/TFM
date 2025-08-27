@@ -17,12 +17,12 @@ parser.add_argument("--wblogger",type=str,default="promptnorm",help = "Determine
 parser.add_argument("--ckpt_dir",type=str,default="train_ckpt",help = "Name of the Directory where the checkpoint is to be saved")
 
 # Training path
-parser.add_argument('--load_ckpt', type=str, default='/home/apinyol/TFM/Models/promptnorm.ckpt', help='pretrained checkpoint path.')
-parser.add_argument('--root_dir', type=str, default='/home/u1604159/Data/RLSID', help='training input data path.')
-parser.add_argument('--normals_dir', type=str, default='/data/storage/datasets/RLSID_promptnorm_100k/train/normals', help='training depth data path.')
+parser.add_argument('--load_ckpt', type=str, default=None, help='pretrained checkpoint path.')
+parser.add_argument('--root_dir', type=str, default='/data/storage/datasets/RLSID', help='training input data path.')
+parser.add_argument('--normals_dir', type=str, default='/home/apinyol/TFM/Data/RLSID_normals/Image/normals', help='training depth data path.')
 
 # Testing / Inference path
-parser.add_argument('--pretrained_ckpt_path', type=str, default='/home/apinyol/TFM/Models/promptnorm.ckpt', help='pretrained checkpoint path.')
+parser.add_argument('--pretrained_ckpt_path', type=str, default='/home/apinyol/TFM/TFM/promptnorm/train_ckpt/epoch=108-step=3270000.ckpt', help='pretrained checkpoint path.')
 
 # Inference and testing output path
 parser.add_argument('--output_path', type=str, default="output/", help='output save path')
